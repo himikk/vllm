@@ -9,6 +9,8 @@ from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
+    int2_w2a16_moe_quant_config,
+    int3_w3a16_moe_quant_config,
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
@@ -51,7 +53,10 @@ class MoeWNA16Config(QuantizationConfig):
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.has_zp = has_zp
-        self.bit8_pack_factor = 8 // self.weight_bits
+        # For power-of-2 bits (2,4,8): clean division
+        # For 3-bit: use Fraction for correct packed size
+        from fractions import Fraction
+        self.bit8_pack_factor = Fraction(8, self.weight_bits)
         self.lm_head_quantized = lm_head_quantized
         self.linear_quant_method = linear_quant_method
         self.full_config = full_config
@@ -153,7 +158,7 @@ class MoeWNA16Config(QuantizationConfig):
 
         awq_min_capability = AWQConfig.get_min_capability()
 
-        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
+        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [2, 3, 4, 8]
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
@@ -304,7 +309,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
 
-        if self.quant_config.has_zp:
+        # Sub-4-bit GPTQ always has qzeros in safetensor (even with sym=True)
+        _alloc_zp = self.quant_config.has_zp or self.quant_config.weight_bits < 4
+        if _alloc_zp:
             w13_qzeros = torch.nn.Parameter(
                 torch.zeros(
                     num_experts,
@@ -333,7 +340,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             # some param are unused, but we need to init them in order to
             # load weights
             invalid_param_keys = ["w13_g_idx", "w2_g_idx"]
-            if not self.quant_config.has_zp:
+            if not _alloc_zp:
                 invalid_param_keys += ["w13_qzeros", "w2_qzeros"]
             for key in invalid_param_keys:
                 param = torch.nn.Parameter(
@@ -347,12 +354,16 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
-        assert weight_bits == 4 or weight_bits == 8
-        config_builder = (
-            int4_w4a16_moe_quant_config
-            if weight_bits == 4
-            else int8_w8a16_moe_quant_config
-        )
+        assert weight_bits in [2, 3, 4, 8], \
+            f"Unsupported weight_bits={weight_bits} for MoE quant config"
+        if weight_bits == 2:
+            config_builder = int2_w2a16_moe_quant_config
+        elif weight_bits == 3:
+            config_builder = int3_w3a16_moe_quant_config
+        elif weight_bits <= 4:
+            config_builder = int4_w4a16_moe_quant_config
+        else:
+            config_builder = int8_w8a16_moe_quant_config
 
         return config_builder(
             w1_scale=layer.w13_scales,
@@ -466,13 +477,13 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 else:
                     loaded_weight = loaded_weight.T
             elif layer.quant_config.linear_quant_method == "gptq":
-                assert layer.quant_config.weight_bits in [4, 8]
+                assert layer.quant_config.weight_bits in [2, 3, 4, 8]
                 if "weight" in weight_name:
                     loaded_weight = loaded_weight.T.contiguous().view(torch.uint8)
                 elif "zeros" in weight_name:
                     # add 1 to gptq qzeros to align with awq
                     loaded_weight = loaded_weight.view(torch.uint8)
-                    if layer.quant_config.weight_bits == 4:
+                    if layer.quant_config.weight_bits in [2, 3, 4]:
                         loaded_weight = convert_gptq_int4_qzeros(loaded_weight).T
                     else:
                         loaded_weight = loaded_weight.T + 1

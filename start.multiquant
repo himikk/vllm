@@ -1,0 +1,267 @@
+#!/bin/bash
+# ============================================================
+# MultiQuant Serve — GLM-4.7-Flash mit konfigurierbarem Profil
+#
+# Nutzung:
+#   ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound
+#   ./start.multiquant --model GLM-4.7-Flash-FP8 --kv tq4
+#   ./start.multiquant --model GLM-4.7-Flash --weights tq3   # BF16 → Archer TQ3
+#   ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound --mtp
+#   ./start.multiquant --model GLM-4.7-Flash-FP8 --riy /data/tensordata/riy_profile_397b.json
+# ============================================================
+
+set -euo pipefail
+
+# ── Defaults ──────────────────────────────────────────────
+KV_DTYPE="tq3"
+WEIGHTS=""               # tq3 | tq4 | rq3 | rq4 (Archer online-quant, leer=keine)
+ROUTED=""                # Per-class: int2 int3 int4 tq3 tq4 rq3 rq4 (leer=vom Modell)
+SHARED=""                # Per-class: bf16 int4 (leer=vom Modell)
+ATTN=""                  # Per-class: int4 bf16 (leer=vom Modell)
+WMTP=""                  # Per-class: bf16 int4 (leer=bf16)
+WDTYPE=""                # Global: xfp xfp2 xfp3 xfp4 fp8 (überschreibt Per-Class)
+WLMHEAD=""               # LM Head / Embedding: fp8 (leer=bf16)
+MODEL_DIR="/data/tensordata"
+MODEL=""
+MTP=false
+RIY_PROFILE=""
+TP=1
+PORT=8011
+SERVED_NAME="glm-4.7-flash"
+REASONING_PARSER=""
+TOOL_PARSER=""
+MAX_MODEL_LEN=32768
+# Auto-detect: GB10 Unified Memory needs lower util (nvidia-smi shows "Not Supported")
+if nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | grep -q "N/A\|Not Supported"; then
+    GPU_MEM_UTIL=0.33   # GB10 Unified Memory (~40 GB for vLLM)
+else
+    GPU_MEM_UTIL=0.95   # Discrete GPU (RTX, A100, etc.)
+fi
+KV_CACHE_MEM=""
+IMAGE="localhost/vllm-multiquant"
+CONTAINER_NAME="mq-serve"
+EXTRA_ARGS=()
+
+# ── Argparse ──────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --kv)       KV_DTYPE="$2"; shift 2 ;;
+        --weights)  WEIGHTS="$2"; shift 2 ;;
+        --routed)   ROUTED="$2"; shift 2 ;;
+        --shared)   SHARED="$2"; shift 2 ;;
+        --attn)     ATTN="$2"; shift 2 ;;
+        --wmtp)     WMTP="$2"; shift 2 ;;
+        --weight-dtype) WDTYPE="$2"; shift 2 ;;
+        --weight-dtype-lm-head) WLMHEAD="$2"; shift 2 ;;
+        --model)    MODEL="$2"; shift 2 ;;
+        --tp)       TP="$2"; shift 2 ;;
+        --mtp)      MTP=true; shift ;;
+        --riy)      RIY_PROFILE="$2"; shift 2 ;;
+        --served-model-name)    SERVED_NAME="$2"; shift 2 ;;
+        --reasoning-parser)    REASONING_PARSER="$2"; shift 2 ;;
+        --tool-call-parser)    TOOL_PARSER="$2"; shift 2 ;;
+        --max-model-len)       MAX_MODEL_LEN="$2"; shift 2 ;;
+        --gpu-memory-utilization) GPU_MEM_UTIL="$2"; shift 2 ;;
+        --kv-cache-memory-bytes) KV_CACHE_MEM="$2"; shift 2 ;;
+        --port)     PORT="$2"; shift 2 ;;
+        --image)    IMAGE="$2"; shift 2 ;;
+        --name)     CONTAINER_NAME="$2"; shift 2 ;;
+        --eager)    EXTRA_ARGS+=("--enforce-eager"); shift ;;
+        --help|-h)
+            echo "Nutzung: $0 [Optionen]"
+            echo ""
+            echo "Optionen:"
+            echo "  --kv TYPE        KV-Cache Typ: tq3 tq4 rq2 rq3 rq4 fp8 (default: tq3)"
+            echo "  --tp N           Tensor Parallelism (default: 1)"
+            echo "  --weights TYPE   Archer online-quant: tq3 tq4 rq3 rq4 (leer=keine)"
+            echo ""
+            echo "  Per-Class Gewichte (RTN quant-on-load, nur fuer BF16-Modelle):"
+            echo "  --routed TYPE    Routed Experts: int2 int3 int4 (leer=vom Modell)"
+            echo "  --shared TYPE    Shared Experts: bf16 int4 (leer=vom Modell)"
+            echo "  --attn TYPE      Attention: int4 bf16 (leer=vom Modell)"
+            echo "  --wmtp TYPE      MTP Layers: bf16 int4 (leer=bf16)"
+            echo "  --weight-dtype TYPE            Global: xfp xfp2 xfp3 xfp4 fp8"
+            echo "  --weight-dtype-lm-head TYPE    LM Head/Embedding: fp8 (leer=bf16)"
+            echo "  --model PATH     Modell-Pfad oder Name unter $MODEL_DIR/ (pflicht)"
+            echo "  --mtp            Multi-Token Prediction aktivieren"
+            echo "  --riy FILE       RIY Expert-Profil JSON (MoE Expert Masking)"
+            echo "  --max-model-len N          Max Kontext-Länge (default: 100000)"
+            echo "  --gpu-memory-utilization F GPU Memory Fraction (default: 0.05, GB10 Unified)"
+            echo "  --kv-cache-memory-bytes N  KV-Cache Speicher, z.B. 10G (default: auto)"
+            echo "  --served-model-name NAME   API Model-Name (default: glm-4.7-flash)"
+            echo "  --reasoning-parser PARSER  Reasoning Parser (optional, z.B. glm45)"
+            echo "  --tool-call-parser PARSER  Tool-Call Parser (optional, z.B. glm47)"
+            echo "  --port PORT                API Port (default: 8011)"
+            echo "  --eager                    enforce-eager (kein CUDA Graphs)"
+            echo "  --image IMAGE              Container Image (default: localhost/vllm-multiquant)"
+            echo "  --name NAME                Container Name (default: mq-serve)"
+            exit 0 ;;
+        *)
+            echo "Unbekannte Option: $1 (--help für Hilfe)"
+            exit 1 ;;
+    esac
+done
+
+# ── Modell-Pfad auflösen ─────────────────────────────────
+if [[ -z "$MODEL" ]]; then
+    echo "FEHLER: --model ist pflicht."
+    echo "Verfügbare Modelle:"
+    ls -d "$MODEL_DIR"/GLM-4.7-Flash* "$MODEL_DIR"/Qwen* 2>/dev/null | sed 's|.*/|  |'
+    echo ""
+    echo "Beispiel: $0 --model GLM-4.7-Flash-int4-AutoRound"
+    exit 1
+fi
+
+# Absoluter Pfad oder relativ zu MODEL_DIR
+if [[ "$MODEL" != /* ]]; then
+    MODEL_PATH="$MODEL_DIR/$MODEL"
+else
+    MODEL_PATH="$MODEL"
+fi
+MODEL_NAME=$(basename "$MODEL_PATH")
+
+# ── Gewichte-spezifische Flags ────────────────────────────
+QUANT_ARGS=()
+QUANT_ENV=()
+
+# Determine if any RTN quantization is requested
+_ANY_RTN=false
+[[ -n "$WEIGHTS" || -n "$ROUTED" || -n "$SHARED" || -n "$ATTN" || -n "$WMTP" || -n "$WDTYPE" || -n "$WLMHEAD" ]] && _ANY_RTN=true
+
+if [[ -n "$WEIGHTS" ]]; then
+    # Archer online-quant: BF16/FP8 → compressed at load time
+    QUANT_ARGS+=("--quantization" "multiquant")
+    QUANT_LABEL="Archer ${WEIGHTS^^}"
+elif $_ANY_RTN; then
+    # Per-class RTN: BF16 → GPTQ at load time
+    QUANT_ARGS+=("--quantization" "autoround_rtn")
+    QUANT_LABEL="RTN per-class"
+else
+    QUANT_LABEL="(vom Modell)"
+fi
+
+# Per-class weight dtype overrides
+[[ -n "$ROUTED" ]] && QUANT_ARGS+=("--weight-dtype-routed" "$ROUTED")
+[[ -n "$SHARED" ]] && QUANT_ARGS+=("--weight-dtype-shared" "$SHARED")
+[[ -n "$ATTN" ]]   && QUANT_ARGS+=("--weight-dtype-attn" "$ATTN")
+[[ -n "$WMTP" ]]   && QUANT_ARGS+=("--weight-dtype-mtp" "$WMTP")
+
+# ── MTP ───────────────────────────────────────────────────
+MTP_LABEL="aus"
+if $MTP; then
+    EXTRA_ARGS+=("--num-speculative-tokens" "1")
+    EXTRA_ARGS+=("--speculative-model" "[ngram]")
+    MTP_LABEL="an (ngram, 1 token)"
+fi
+
+# ── RIY ───────────────────────────────────────────────────
+RIY_LABEL="aus"
+if [[ -n "$RIY_PROFILE" ]]; then
+    if [[ ! -f "$RIY_PROFILE" ]]; then
+        echo "FEHLER: RIY Profil nicht gefunden: $RIY_PROFILE"
+        echo "Verfügbare Profile:"
+        ls /data/tensordata/riy_profile*.json 2>/dev/null | sed 's|.*/|  |'
+        exit 1
+    fi
+    EXTRA_ARGS+=("--riy-expert-profile" "$RIY_PROFILE")
+    RIY_LABEL=$(basename "$RIY_PROFILE")
+fi
+
+# ── KV Cache Memory ──────────────────────────────────────
+if [[ -n "$KV_CACHE_MEM" ]]; then
+    EXTRA_ARGS+=("--kv-cache-memory-bytes" "$KV_CACHE_MEM")
+fi
+
+# ── Parsers (only if explicitly set) ────────────────────
+if [[ -n "$TOOL_PARSER" ]]; then
+    EXTRA_ARGS+=("--tool-call-parser" "$TOOL_PARSER" "--enable-auto-tool-choice")
+fi
+if [[ -n "$REASONING_PARSER" ]]; then
+    EXTRA_ARGS+=("--reasoning-parser" "$REASONING_PARSER")
+fi
+
+# ── Banner ────────────────────────────────────────────────
+printf "╔══════════════════════════════════════════════════════╗\n"
+printf "║  MultiQuant Serve                                    ║\n"
+printf "╠══════════════════════════════════════════════════════╣\n"
+printf "║  Modell:   %-40s ║\n" "$MODEL_NAME"
+printf "║  Gewichte: %-40s ║\n" "$QUANT_LABEL"
+if $_ANY_RTN && [[ -z "$WEIGHTS" ]]; then
+printf "║    Routed: %-40s ║\n" "${ROUTED:-vom Modell}"
+printf "║    Shared: %-40s ║\n" "${SHARED:-vom Modell}"
+printf "║    Attn:   %-40s ║\n" "${ATTN:-vom Modell}"
+printf "║    MTP:    %-40s ║\n" "${WMTP:-bf16}"
+fi
+printf "║  KV-Cache: %-40s ║\n" "$KV_DTYPE"
+printf "║  TP:       %-40s ║\n" "$TP"
+printf "║  MTP:      %-40s ║\n" "$MTP_LABEL"
+printf "║  RIY:      %-40s ║\n" "$RIY_LABEL"
+printf "║  Port:     %-40s ║\n" "$PORT"
+printf "╚══════════════════════════════════════════════════════╝\n"
+echo ""
+
+# ── Prüfungen ────────────────────────────────────────────
+if ! podman image exists "$IMAGE"; then
+    echo "FEHLER: Image '$IMAGE' nicht gefunden."
+    echo "Bauen mit: podman build -f Dockerfile.multiquant -t vllm-multiquant ."
+    exit 1
+fi
+
+if [[ ! -d "$MODEL_PATH" ]]; then
+    echo "FEHLER: Modell nicht gefunden: $MODEL_PATH"
+    echo "Verfügbare Modelle:"
+    ls -d "$MODEL_DIR"/GLM-4.7-Flash* 2>/dev/null | sed 's|.*/|  |'
+    exit 1
+fi
+
+# Vorherigen Container stoppen
+podman stop "$CONTAINER_NAME" 2>/dev/null || true
+podman rm "$CONTAINER_NAME" 2>/dev/null || true
+
+# ── Container starten ────────────────────────────────────
+podman run -d \
+  --replace \
+  --name "$CONTAINER_NAME" \
+  --device nvidia.com/gpu=all \
+  --security-opt=label=disable \
+  --hooks-dir=/usr/share/containers/oci/hooks.d \
+  --log-driver=k8s-file \
+  --log-opt path=/data/tensordata/logs/mq-serve.log \
+  --ipc=host \
+  --network host \
+  -v /data/tensordata:/data/tensordata \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -e VLLM_MLA_DISABLE=1 \
+  -e VLLM_WORKER_MULTIPROC_METHOD=fork \
+  -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+  -e FLASHINFER_DISABLE_AUTOTUNER=1 \
+  -e VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
+  -e FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a" \
+  "${QUANT_ENV[@]}" \
+  "$IMAGE" \
+  vllm serve "$MODEL_PATH" \
+    --host 0.0.0.0 \
+    --port "$PORT" \
+    --served-model-name "$SERVED_NAME" \
+    --tensor-parallel-size "$TP" \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --kv-cache-dtype "$KV_DTYPE" \
+    --trust-remote-code \
+    "${QUANT_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}"
+
+echo ""
+echo "Container '$CONTAINER_NAME' gestartet."
+echo ""
+echo "  Logs:     podman logs -f $CONTAINER_NAME"
+echo "  API:      http://localhost:$PORT/v1/chat/completions"
+echo "  Stoppen:  podman stop $CONTAINER_NAME"
+echo ""
+echo "  Beispiele:"
+echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound"
+echo "    ./start.multiquant --model GLM-4.7-Flash-FP8 --kv tq4"
+echo "    ./start.multiquant --model GLM-4.7-Flash --weights tq3"
+echo "    ./start.multiquant --model GLM-4.7-Flash --routed int3 --kv tq3"
+echo "    ./start.multiquant --model GLM-4.7-Flash --routed int4 --attn int4 --shared bf16"
+echo "    ./start.multiquant --model GLM-4.7-Flash-int4-AutoRound --mtp"

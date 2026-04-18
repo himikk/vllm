@@ -1005,6 +1005,88 @@ def safetensors_weights_iterator(
                     yield name, param
 
 
+def layer_grouped_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    safetensors_load_strategy: str = "lazy",
+    local_expert_ids: set[int] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield safetensor weights grouped by `.layers.N.` prefix.
+
+    Standard `safetensors_weights_iterator` streams keys in shard order,
+    which interleaves keys from many layers. That breaks the per-layer
+    streaming-quant trigger: materialize-on-first-touch allocates full
+    MoE `[num_experts, N, K]` storage for every layer before any of them
+    is complete, pushing peak memory to the full model size.
+
+    This iterator pre-indexes every shard's keys, groups them by layer
+    number, and yields non-layer keys first (embeddings, norms, lm_head),
+    then layer 0, layer 1, ... in order. Each layer's keys are yielded
+    contiguously, so when the last key of layer N arrives, the quant
+    trigger fires and frees BF16 storage before layer N+1's first touch.
+
+    Memory overhead: ~1 MiB for the index; no 2x buffering.
+    """
+    import re as _re
+    from collections import defaultdict as _defaultdict
+
+    loading_desc = "Loading safetensors (layer-grouped)"
+    if safetensors_load_strategy == "eager":
+        loading_desc += " (eager)"
+
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    if safetensors_load_strategy == "prefetch":
+        _prefetch_all_checkpoints(sorted_files)
+
+    _LAYER_RE = _re.compile(r"\.layers\.(\d+)\.")
+
+    # Pass 1: open every shard once, record (layer_id, shard_path, key).
+    # layer_id is -1 for non-layer keys (embeddings, norms, lm_head, ...).
+    index: list[tuple[int, str, str]] = []
+    for st_file in sorted_files:
+        with safe_open(st_file, framework="pt") as f:
+            for name in f.keys():  # noqa: SIM118
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                m = _LAYER_RE.search(name)
+                layer_id = int(m.group(1)) if m else -1
+                index.append((layer_id, st_file, name))
+
+    # Sort: non-layer keys (-1) first, then layers in numeric order.
+    # Stable sort preserves original shard ordering within a layer.
+    index.sort(key=lambda it: (it[0],))
+
+    # Pass 2: yield each key. Open shards lazily and cache the most recent
+    # handle — keys are grouped by layer but a layer's keys can still span
+    # several shards, so we may revisit shard files.
+    current_path: str | None = None
+    current_handle = None
+    try:
+        bar = tqdm(
+            total=len(index),
+            desc=loading_desc,
+            disable=not enable_tqdm(use_tqdm_on_load),
+            bar_format=_BAR_FORMAT,
+        )
+        for layer_id, st_file, name in index:
+            if st_file != current_path:
+                if current_handle is not None:
+                    current_handle.__exit__(None, None, None)
+                current_handle = safe_open(st_file, framework="pt")
+                current_handle.__enter__()
+                current_path = st_file
+            yield name, current_handle.get_tensor(name)
+            bar.update(1)
+        bar.close()
+    finally:
+        if current_handle is not None:
+            try:
+                current_handle.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,

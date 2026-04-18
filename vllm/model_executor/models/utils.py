@@ -326,6 +326,16 @@ class AutoWeightsLoader:
 
                     continue
 
+                # For mixed-precision quantized models (e.g. AutoRound),
+                # some layers are quantized (have g_idx, qzeros, qweight)
+                # while others are BF16. Skip unknown quant params gracefully.
+                _quant_suffixes = (".g_idx", ".qzeros", ".qweight", ".scales")
+                if any(prefix.endswith(s) for s in _quant_suffixes):
+                    logger.debug(
+                        "Skipping quant param %s (not in model, "
+                        "likely unquantized layer)", prefix)
+                    continue
+
                 named_parameters = module.named_parameters(recurse=True)
                 desc_param_keys = {
                     maybe_prefix(base_prefix, k) for k, _ in named_parameters

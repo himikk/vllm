@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+Normierter Performance + Accuracy Benchmark fuer LLM endpoints.
+Tests: throughput (tok/s), latency (TTFT), math accuracy.
+
+WICHTIG: Dieses Script erzeugt deterministische Testdaten (random.seed(42)).
+         Prompts und Mathe-Aufgaben sind fuer ALLE Konfigurationen identisch.
+         Nicht aendern, damit Ergebnisse vergleichbar bleiben!
+
+Usage:
+  python3 bench.py --url http://localhost:8011 --model qwen3-coder-30b-bf16 --label "SGLang BF16 Vanilla (DGX)"
+  python3 bench.py --url http://10.249.0.99:8011 --model qwen3-coder-30b-fp8 --label "vLLM FP8 (Spiegel 2)"
+
+Prompts (fix):
+  short:  "Was ist 7*8? Antworte nur mit der Zahl."                          max_tokens=20
+  medium: "Erklaere in 3 Saetzen was ein Transformer ist."                   max_tokens=150
+  long:   "Schreibe eine Python-Funktion die prueft ob eine Zahl prim ist."  max_tokens=400
+
+Math (deterministic, seed=42):
+  50 zufaellige Aufgaben (+, -, *) mit Zahlen 10-999, temperature=0
+
+Context scaling (optional, --context):
+  short/medium/long Prompts bei 0/512/2K/8K/16K Input-Context
+  Matrix: 3 Output-Laengen x 5 Kontextlaengen = 15 Messpunkte
+"""
+import argparse
+import json
+import os
+import random
+import sys
+import time
+import urllib.request
+
+# Unbuffered stdout so progress is visible in real-time
+sys.stdout.reconfigure(line_buffering=True)
+
+def chat(url, model, prompt, max_tokens=200, temperature=0):
+    """Send chat request, return (content, completion_tokens, elapsed_s, ttft_s)."""
+    data = json.dumps({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        f"{url}/v1/chat/completions",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        body = json.loads(resp.read())
+    elapsed = time.time() - t0
+    msg = body["choices"][0]["message"]
+    content = msg["content"]
+    # Reasoning-Parser: content kann None sein wenn alle Tokens fuers Denken draufgehen
+    if content is None:
+        content = msg.get("reasoning") or ""
+    tokens = body["usage"]["completion_tokens"]
+    return content, tokens, elapsed
+
+def perf_test(url, model, n=5):
+    """Run throughput tests with varying output lengths."""
+    prompts = [
+        ("short", "Was ist 7*8? Antworte nur mit der Zahl.", 20),
+        ("medium", "Erkläre in 3 Sätzen was ein Transformer ist.", 150),
+        ("long", "Schreibe eine Python-Funktion die prüft ob eine Zahl prim ist. Erkläre den Code.", 400),
+    ]
+    results = []
+    for label, prompt, max_tok in prompts:
+        times = []
+        tokens_list = []
+        for _ in range(n):
+            _, tokens, elapsed = chat(url, model, prompt, max_tok)
+            tok_s = tokens / elapsed if elapsed > 0 else 0
+            times.append(elapsed)
+            tokens_list.append(tokens)
+        avg_tok = sum(tokens_list) / len(tokens_list)
+        avg_time = sum(times) / len(times)
+        avg_toks = avg_tok / avg_time if avg_time > 0 else 0
+        results.append({
+            "type": label,
+            "avg_tokens": avg_tok,
+            "avg_time_s": round(avg_time, 2),
+            "avg_tok_s": round(avg_toks, 1),
+        })
+        print(f"  {label:8s}: {avg_toks:6.1f} tok/s  ({avg_tok:.0f} tok in {avg_time:.2f}s, n={n})")
+    return results
+
+def context_test(url, model, contexts=None, n=2):
+    """Run short/medium/long prompts at varying context lengths."""
+    if contexts is None:
+        contexts = [0, 512, 2048, 8192, 16384]
+
+    prompts = [
+        ("short", "Was ist 7*8? Antworte nur mit der Zahl.", 20),
+        ("medium", "Erkläre in 3 Sätzen was ein Transformer ist.", 150),
+        ("long", "Schreibe eine Python-Funktion die prüft ob eine Zahl prim ist. Erkläre den Code.", 400),
+    ]
+
+    # Build filler text: deterministic lorem-style padding
+    random.seed(42)
+    words = ("the quick brown fox jumps over a lazy dog near the river bank while "
+             "clouds drift slowly across the wide blue sky and birds sing softly in "
+             "the tall green trees beside the old stone wall that runs along ").split()
+
+    results = []
+    for ctx in contexts:
+        # Build filler prefix
+        if ctx <= 0:
+            filler = ""
+        else:
+            n_words = int(ctx / 1.3)
+            filler_words = []
+            for i in range(n_words):
+                filler_words.append(words[i % len(words)])
+            filler = " ".join(filler_words)
+
+        print(f"  --- ctx={ctx:,d} ---")
+        ctx_results = {"context": ctx, "prompts": []}
+        for label, base_prompt, max_tok in prompts:
+            if filler:
+                prompt = f"Here is some context:\n\n{filler}\n\n{base_prompt}"
+            else:
+                prompt = base_prompt
+
+            times = []
+            tokens_list = []
+            for run in range(n):
+                _, tokens, elapsed = chat(url, model, prompt, max_tokens=max_tok, temperature=0)
+                times.append(elapsed)
+                tokens_list.append(tokens)
+
+            avg_tok = sum(tokens_list) / len(tokens_list)
+            avg_time = sum(times) / len(times)
+            avg_toks = avg_tok / avg_time if avg_time > 0 else 0
+            ctx_results["prompts"].append({
+                "type": label,
+                "avg_tokens": avg_tok,
+                "avg_time_s": round(avg_time, 2),
+                "avg_tok_s": round(avg_toks, 1),
+            })
+            print(f"    {label:8s}: {avg_toks:6.1f} tok/s  ({avg_tok:.0f} tok in {avg_time:.2f}s, n={n})")
+        results.append(ctx_results)
+    return results
+
+
+def math_test(url, model, n=50):
+    """Run math accuracy tests."""
+    random.seed(42)
+    correct = 0
+    total = n
+    errors = []
+
+    for i in range(n):
+        a = random.randint(10, 999)
+        b = random.randint(10, 999)
+        op = random.choice(["+", "-", "*"])
+        expected = eval(f"{a}{op}{b}")
+
+        # Use completions API (not chat) to avoid thinking/reasoning overhead.
+        # Chat API triggers <think> on reasoning models → answer never arrives.
+        prompt = f"{a} {op} {b} = "
+        data = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 200,
+            "temperature": 0,
+        }).encode()
+        req = urllib.request.Request(
+            f"{url}/v1/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+        content = body["choices"][0]["text"]
+        import re as _re
+        # Strip thousand-separator commas (e.g. "130,696" → "130696")
+        content_clean = _re.sub(r'(\d),(\d)', r'\1\2', content)
+        nums = [int(x) for x in _re.findall(r'-?\d+', content_clean)]
+        operands = {a, b}
+        filtered = [n for n in nums if n not in operands]
+
+        got_it = expected in nums or expected in filtered
+        if got_it:
+            correct += 1
+        else:
+            errors.append(f"  {a}{op}{b}={expected}, got: {content.strip()[:40]}")
+
+    pct = correct / total * 100
+    print(f"  Math: {correct}/{total} ({pct:.0f}%)")
+    if errors:
+        for e in errors[:5]:
+            print(e)
+        if len(errors) > 5:
+            print(f"  ... und {len(errors)-5} weitere Fehler")
+    return {"correct": correct, "total": total, "pct": round(pct, 1)}
+
+def memory_stats(url):
+    """Query vLLM /metrics endpoint for KV cache and GPU usage."""
+    try:
+        resp = urllib.request.urlopen(f"{url}/metrics", timeout=5).read().decode()
+        stats = {}
+        for line in resp.splitlines():
+            if line.startswith("#"):
+                continue
+            if "kv_cache_usage_perc" in line and not line.startswith("#"):
+                try:
+                    stats["kv_cache_usage_%"] = round(float(line.split()[-1]) * 100, 1)
+                except (ValueError, IndexError):
+                    pass
+            if "gpu_cache_usage_perc" in line and not line.startswith("#"):
+                try:
+                    stats["gpu_cache_usage_%"] = round(float(line.split()[-1]) * 100, 1)
+                except (ValueError, IndexError):
+                    pass
+            if "num_requests_running" in line and not line.startswith("#"):
+                try:
+                    stats["requests_running"] = int(float(line.split()[-1]))
+                except (ValueError, IndexError):
+                    pass
+        if stats:
+            parts = []
+            if "kv_cache_usage_%" in stats:
+                parts.append(f"KV cache: {stats['kv_cache_usage_%']:.1f}%")
+            if "gpu_cache_usage_%" in stats:
+                parts.append(f"GPU cache: {stats['gpu_cache_usage_%']:.1f}%")
+            print(f"  Memory: {', '.join(parts)}")
+        return stats
+    except Exception:
+        return {}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--label", required=True)
+    parser.add_argument("--perf-rounds", type=int, default=5)
+    parser.add_argument("--math-count", type=int, default=50)
+    parser.add_argument("--skip-math", action="store_true")
+    parser.add_argument("--skip-perf", action="store_true")
+    parser.add_argument("--context", action="store_true", help="Run short/medium/long at 0/512/2K/8K/16K context")
+    parser.add_argument("--context-sizes", type=int, nargs="+", default=[0, 512, 2048, 8192, 16384])
+    parser.add_argument("--context-rounds", type=int, default=2)
+    args = parser.parse_args()
+
+    print(f"\n{'='*60}")
+    print(f"Benchmark: {args.label}")
+    print(f"URL: {args.url}  Model: {args.model}")
+    print(f"{'='*60}")
+
+    results = {"label": args.label, "url": args.url, "model": args.model}
+
+    if not args.skip_perf:
+        print(f"\n--- Performance (n={args.perf_rounds}) ---")
+        results["perf"] = perf_test(args.url, args.model, args.perf_rounds)
+
+    if not args.skip_math:
+        print(f"\n--- Math Accuracy (n={args.math_count}) ---")
+        results["math"] = math_test(args.url, args.model, args.math_count)
+
+    if args.context:
+        print(f"\n--- Context Scaling (n={args.context_rounds}) ---")
+        results["context"] = context_test(
+            args.url, args.model, args.context_sizes,
+            args.context_rounds)
+
+    # Memory stats from /metrics
+    print(f"\n--- Memory ---")
+    results["memory"] = memory_stats(args.url)
+
+    print(f"\n{'='*60}")
+    # Output JSON for programmatic use
+    print(f"\nJSON: {json.dumps(results)}")
+
+if __name__ == "__main__":
+    main()

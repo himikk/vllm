@@ -308,6 +308,8 @@ using ScalarTypeId = ScalarType::Id;
 
 // "rust style" names generally following:
 //   https://github.com/pytorch/pytorch/blob/6d9f74f0af54751311f0dd71f7e5c01a93260ab3/torch/csrc/api/include/torch/types.h#L60-L70
+static inline constexpr auto kU2B2 = ScalarType::uint(2, 2);
+static inline constexpr auto kU3B4 = ScalarType::uint(3, 4);
 static inline constexpr auto kS4 = ScalarType::int_(4);
 static inline constexpr auto kU4 = ScalarType::uint(4);
 static inline constexpr auto kU4B8 = ScalarType::uint(4, 8);

@@ -284,7 +284,10 @@ def fused_marlin_moe(
         scalar_types.float4_e2m1f,
     ]
 
+    # Sub-4-bit types (INT2, INT3) use INT4 Marlin kernel (stored in 4-bit slots)
     bit4_scalar_types = [
+        scalar_types.uint2b2,
+        scalar_types.uint3b4,
         scalar_types.uint4,
         scalar_types.uint4b8,
         scalar_types.float4_e2m1f,
@@ -442,6 +445,8 @@ def batched_fused_marlin_moe(
     ]
 
     bit4_scalar_types = [
+        scalar_types.uint2b2,
+        scalar_types.uint3b4,
         scalar_types.uint4,
         scalar_types.uint4b8,
         scalar_types.float4_e2m1f,

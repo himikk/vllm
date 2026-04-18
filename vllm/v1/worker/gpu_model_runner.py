@@ -4840,6 +4840,14 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+        # XFP summary after all weights are loaded
+        try:
+            from vllm.multiquant.policy import MultiQuantPolicyRegistry
+            reg = MultiQuantPolicyRegistry.get_active()
+            if reg is not None:
+                reg.log_stats_summary()
+        except Exception as e:
+            logger.warning("XFP stats summary failed: %s", e)
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (

@@ -63,6 +63,20 @@ THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
 
 QUANT_CONFIGS = [
+    # GPTQ-INT2
+    {
+        "b_type": "kU2B2",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": THREAD_M_BLOCKS,
+        "group_blocks": [-1, 2, 4, 8],
+    },
+    # GPTQ-INT3 (packed as 4-bit with 1 wasted bit per slot)
+    {
+        "b_type": "kU3B4",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": THREAD_M_BLOCKS,
+        "group_blocks": [-1, 2, 4, 8],
+    },
     # AWQ-INT4
     {
         "b_type": "kU4",

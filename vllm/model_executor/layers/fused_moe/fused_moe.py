@@ -122,6 +122,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    w_bit_width: tl.constexpr = 4,  # 2, 3, or 4 for sub-8-bit
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -202,13 +203,18 @@ def fused_moe_kernel_gptq_awq(
     )
 
     if use_int4_w4a16:
+        # Pack factor: how many values per int32 element
+        # INT4: 8 per int32, 2 per byte → offs_k // 2, shift * 4
+        # INT2: 16 per int32, 4 per byte → offs_k // 4, shift * 2
+        # INT3 in 4-bit slots: same as INT4
+        pack_per_byte = 8 // w_bit_width  # 2 for INT4, 4 for INT2
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
-            + (offs_k[:, None] // 2) * stride_bk
+            + (offs_k[:, None] // pack_per_byte) * stride_bk
             + offs_bn[None, :] * stride_bn
         )
-        b_shifter = (offs_k[:, None] % 2) * 4
+        b_shifter = (offs_k[:, None] % pack_per_byte) * w_bit_width
     elif use_int8_w8a16:
         b_ptrs = (
             b_ptr
@@ -218,11 +224,11 @@ def fused_moe_kernel_gptq_awq(
         )
 
     if not has_zp and use_int4_w4a16:
-        b_zp_num = 8
+        b_zp_num = 1 << (w_bit_width - 1)  # 8 for INT4, 2 for INT2, 4 for INT3
     if not has_zp and use_int8_w8a16:
         b_zp_num = 128
     elif has_zp and use_int4_w4a16:
-        b_zp_shifter = (offs_bn[None, :] % 2) * 4
+        b_zp_shifter = (offs_bn[None, :] % pack_per_byte) * w_bit_width
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -248,7 +254,8 @@ def fused_moe_kernel_gptq_awq(
         )
         b = tl.load(b_ptrs)
         if use_int4_w4a16:
-            b = (b >> b_shifter) & 0xF
+            b_mask = (1 << w_bit_width) - 1  # 0xF for 4-bit, 0x3 for 2-bit
+            b = (b >> b_shifter) & b_mask
 
         b_scale_ptrs = (
             b_scale_ptr
@@ -264,11 +271,11 @@ def fused_moe_kernel_gptq_awq(
             b_zp_ptrs = (
                 b_zp_ptr
                 + off_experts * stride_bze
-                + (offs_bn[None, :] // 2) * stride_bzn
+                + (offs_bn[None, :] // pack_per_byte) * stride_bzn
                 + offs_k_true * stride_bzk
             )
             b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = (b_zp >> b_zp_shifter) & 0xF
+            b_zp = (b_zp >> b_zp_shifter) & b_mask
             b_zp = b_zp.to(tl.float32)
         elif has_zp and use_int8_w8a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
@@ -654,6 +661,20 @@ def invoke_fused_moe_wna16_triton_kernel(
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
 
+    # Infer weight bit width from pack ratio (K / packed_k)
+    # INT4: K/8 packed → ratio=8 → bits=4
+    # INT2: K/16 packed → ratio=16 → bits=2
+    w_bit_width = 4  # default
+    if use_int4_w4a16:
+        K_full = A.size(1)
+        K_packed = B.size(2)  # B is [E, N, K_packed]
+        if K_packed > 0:
+            ratio = K_full // K_packed
+            if ratio == 16:
+                w_bit_width = 2
+            elif ratio == 8:
+                w_bit_width = 4
+
     M = A.size(0)
     num_tokens = M * top_k
 
@@ -718,6 +739,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        w_bit_width=w_bit_width if use_int4_w4a16 else 4,
         **config,
     )
 
@@ -1254,7 +1276,10 @@ def get_default_config(
             "GROUP_SIZE_M": 1 if M <= 16 else 32,
             "SPLIT_K": 1,
             "num_warps": 4,
-            "num_stages": 3 if not current_platform.is_rocm() else num_stages_rocm,
+            "num_stages": 2 if (current_platform.is_rocm()
+                or (current_platform.is_cuda()
+                    and current_platform.get_device_capability().major >= 12)
+                ) else 3,
         }
     elif dtype in ["int4_w4a16", "int8_w8a16"] and block_shape is not None:
         # moe wna16 kernels
@@ -1303,6 +1328,11 @@ def get_default_config(
 
         if current_platform.is_rocm():
             num_stages = num_stages_rocm
+        elif (current_platform.is_cuda()
+              and current_platform.get_device_capability().major >= 12):
+            # SM12x (GB10/RTX PRO 6000): 100KB SMEM/SM, 48KB/block
+            # num_stages=4 needs ~147KB → crash
+            num_stages = 2
         elif M <= 32:
             num_stages = 4
         else:
@@ -1662,7 +1692,7 @@ def fused_experts_impl(
 
     # Check constraints.
     if use_int4_w4a16:
-        assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
+        pass  # Sub-4-bit (INT2/INT3/INT4) have varying pack factors
     elif ocp_mx_scheme is not None:
         if ocp_mx_scheme.startswith("w_mxfp4"):
             # 16bit activation and fp4x2 packed weight
@@ -2017,7 +2047,7 @@ class TritonExperts(mk.FusedMoEExpertsModular):
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
-            assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
+            pass  # Relaxed: INT2/INT3 have different pack factors
         else:
             assert hidden_states.size(-1) == w1.size(2), (
                 f"Hidden size mismatch {hidden_states.size(-1)} != {w1.size(2)}"
@@ -2203,7 +2233,7 @@ class TritonWNA16Experts(TritonExperts):
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
-            assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
+            pass  # Relaxed: INT2/INT3 have different pack factors
         else:
             assert hidden_states.size(-1) == w1.size(2), (
                 f"Hidden size mismatch {hidden_states.size(-1)} != {w1.size(2)}"

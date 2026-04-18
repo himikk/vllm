@@ -396,6 +396,16 @@ class EngineArgs:
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    # MultiQuant per-class overrides (optional)
+    k_dtype: str | None = None
+    v_dtype: str | None = None
+    weight_dtype: str | None = None
+    weight_dtype_shared: str | None = None
+    weight_dtype_routed: str | None = None
+    weight_dtype_attn: str | None = None
+    weight_dtype_mtp: str | None = None
+    weight_dtype_lm_head: str | None = None
+    weight_dtype_dense: str | None = None
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -450,6 +460,7 @@ class EngineArgs:
     )
     eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
     enable_eplb: bool = ParallelConfig.enable_eplb
+    riy_expert_profile: str | None = ParallelConfig.riy_expert_profile
     expert_placement_strategy: ExpertPlacementStrategy = (
         ParallelConfig.expert_placement_strategy
     )
@@ -1003,6 +1014,7 @@ class EngineArgs:
             **parallel_kwargs["disable_nccl_for_dp_synchronization"],
         )
         parallel_group.add_argument("--enable-eplb", **parallel_kwargs["enable_eplb"])
+        parallel_group.add_argument("--riy-expert-profile", **parallel_kwargs["riy_expert_profile"])
         parallel_group.add_argument("--eplb-config", **parallel_kwargs["eplb_config"])
         parallel_group.add_argument(
             "--expert-placement-strategy",
@@ -1039,6 +1051,34 @@ class EngineArgs:
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        # MultiQuant per-class dtype overrides
+        cache_group.add_argument(
+            "--k-dtype", type=str, default=None,
+            help="Override K-cache dtype (overrides --kv-cache-dtype for K)")
+        cache_group.add_argument(
+            "--v-dtype", type=str, default=None,
+            help="Override V-cache dtype (overrides --kv-cache-dtype for V)")
+        cache_group.add_argument(
+            "--weight-dtype", type=str, default=None,
+            help="On-the-fly weight quantization: BF16/FP8 → target dtype")
+        cache_group.add_argument(
+            "--weight-dtype-shared", type=str, default=None,
+            help="Weight dtype for shared experts only")
+        cache_group.add_argument(
+            "--weight-dtype-routed", type=str, default=None,
+            help="Weight dtype for routed experts only")
+        cache_group.add_argument(
+            "--weight-dtype-attn", type=str, default=None,
+            help="Weight dtype for attention weights only")
+        cache_group.add_argument(
+            "--weight-dtype-mtp", type=str, default=None,
+            help="Weight dtype for MTP layers")
+        cache_group.add_argument(
+            "--weight-dtype-lm-head", type=str, default=None,
+            help="Weight dtype for LM head")
+        cache_group.add_argument(
+            "--weight-dtype-dense", type=str, default=None,
+            help="Weight dtype for dense MLP layers")
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1621,6 +1661,48 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        # Build and log MultiQuant Policy Registry
+        from vllm.multiquant.policy import MultiQuantPolicyRegistry
+        model_qc = getattr(
+            model_config.hf_config, "quantization_config", None)
+        if isinstance(model_qc, dict):
+            _mqc = model_qc
+        else:
+            _mqc = None
+        _hf_text = getattr(model_config, "hf_text_config",
+                           getattr(model_config, "hf_config", None))
+        self._mq_policy = MultiQuantPolicyRegistry.from_cli(
+            kv_cache_dtype=resolved_cache_dtype,
+            k_dtype=self.k_dtype,
+            v_dtype=self.v_dtype,
+            weight_dtype=self.weight_dtype,
+            weight_dtype_shared=self.weight_dtype_shared,
+            weight_dtype_routed=self.weight_dtype_routed,
+            weight_dtype_attn=self.weight_dtype_attn,
+            weight_dtype_mtp=getattr(self, "weight_dtype_mtp", None),
+            weight_dtype_lm_head=getattr(self, "weight_dtype_lm_head", None),
+            weight_dtype_dense=getattr(self, "weight_dtype_dense", None),
+            model_quant_config=_mqc,
+            hf_config=_hf_text,
+        )
+        self._mq_policy.log_policy()
+
+        # Inject policy into quantization_config so it survives Engine Core
+        # process fork (AutoRoundRTNConfig.from_config reads it back)
+        # Uses dtype strings (not just bits) for future-proofing:
+        # int4, nf4, mxfp4 all have 4 bits but need different kernels.
+        if self.quantization == "autoround_rtn":
+            qc = getattr(model_config.hf_config, "quantization_config", None)
+            if qc is None:
+                qc = {}
+            qc["_mq_class_dtype"] = {
+                k: p.dtype for k, p in self._mq_policy._policies.items()
+            }
+            qc["_mq_class_gs"] = {
+                k: p.group_size for k, p in self._mq_policy._policies.items()
+            }
+            model_config.hf_config.quantization_config = qc
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -1856,6 +1938,7 @@ class EngineArgs:
             dbo_prefill_token_threshold=self.dbo_prefill_token_threshold,
             disable_nccl_for_dp_synchronization=self.disable_nccl_for_dp_synchronization,
             enable_eplb=self.enable_eplb,
+            riy_expert_profile=self.riy_expert_profile,
             eplb_config=self.eplb_config,
             expert_placement_strategy=self.expert_placement_strategy,
             max_parallel_loading_workers=self.max_parallel_loading_workers,

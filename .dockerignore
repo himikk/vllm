@@ -13,6 +13,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 /build/
+!/build/moe-configs
+!/build/wheels
 cmake-build-*/
 CMakeUserPresets.json
 develop-eggs/

@@ -549,7 +549,7 @@ __global__ void Marlin(
   int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
-  constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
+  constexpr int b_thread_vecs = (b_type.size_bits() <= 4) ? 1 : 2;
   constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
@@ -684,7 +684,7 @@ __global__ void Marlin(
   // (without column-wise case)
   constexpr int num_col_threads = 8;
   constexpr int num_row_threads = 4;
-  constexpr int num_ints_per_thread = 8 / pack_factor;
+  constexpr int num_ints_per_thread = (8 / pack_factor) > 0 ? (8 / pack_factor) : 1;
   int zp_sh_rd;
   if constexpr (has_zp) {
     if constexpr (is_zp_float) {
@@ -1189,7 +1189,7 @@ __global__ void Marlin(
         if constexpr (group_blocks == -1) is_first_matmul_in_slice = false;
         int zp_quant_0, zp_quant_1;
 
-        if constexpr (b_type.size_bits() == 4) {
+        if constexpr (b_type.size_bits() <= 4) {
           zp_quant_0 = frag_qzp[k2][0];
           zp_quant_1 = zp_quant_0 >> 8;
         } else {
@@ -1231,6 +1231,14 @@ __global__ void Marlin(
       if constexpr (b_type_id == vllm::kFE2M1f.id()) {
         b_quant_1 = frag_b_quant[k2][0][j];
         b_quant_0 = b_quant_1 << 8;
+      } else if constexpr (b_type.size_bits() == 2) {
+        // INT2: 16 values per int32, extract in pairs
+        b_quant_0 = frag_b_quant[k2][0][j];
+        b_quant_1 = b_quant_0 >> 4;
+      } else if constexpr (b_type.size_bits() == 3) {
+        // INT3 stored in 4-bit slots: same extraction as INT4
+        b_quant_0 = frag_b_quant[k2][0][j];
+        b_quant_1 = b_quant_0 >> 8;
       } else if constexpr (b_type.size_bits() == 4) {
         b_quant_0 = frag_b_quant[k2][0][j];
         b_quant_1 = b_quant_0 >> 8;
@@ -1298,12 +1306,12 @@ __global__ void Marlin(
     for (int j = 0; j < 2; j++) {
       FragB frag_b[2];
 
-      if (is_a_8bit && b_type.size_bits() == 4 && !has_zp) {
+      if (is_a_8bit && b_type.size_bits() <= 4 && !has_zp) {
         dequant_data(frag_b_quant[k2][0][j * 2],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b));
         dequant_data(frag_b_quant[k2][0][j * 2 + 1],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2);
-      } else if (is_a_8bit && b_type.size_bits() == 4 && has_zp) {
+      } else if (is_a_8bit && b_type.size_bits() <= 4 && has_zp) {
         int off = (threadIdx.x / 32) % 2 * 2 + j;
         int zp = (frag_qzp[k2][0] >> (off * 8)) & 0xF;
         dequant_data(frag_b_quant[k2][0][j * 2],
@@ -1662,7 +1670,7 @@ __global__ void Marlin(
       // For per-column quantization we finally apply the scale here (only for
       // 4-bit)
       if constexpr (!has_act_order && group_blocks == -1 && !is_a_8bit &&
-                    b_type.size_bits() == 4 &&
+                    b_type.size_bits() <= 4 &&
                     (has_zp && dequant_skip_flop || !has_zp)) {
         c_scalar_t2 tmp_scale = s[0];
         if constexpr (m_block_size_8) {

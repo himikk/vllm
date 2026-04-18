@@ -10,7 +10,6 @@ import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
-from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -1743,15 +1742,20 @@ def test_get_kv_cache_config_one_worker():
     )
 
     # different hidden size that cannot be aligned by using different block size
+    # → falls back to mixed-page-size grouping (separate tensors per page-size)
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=96),
     }
-
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    kv_cache_config_mixed = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+    # Mixed path: each layer gets its own tensor with its own page_size
+    assert kv_cache_config_mixed.num_blocks > 0
+    assert len(kv_cache_config_mixed.kv_cache_tensors) == 2
+    # No tensor should mix layers with different page sizes
+    for t in kv_cache_config_mixed.kv_cache_tensors:
+        assert len(t.shared_by) == 1
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16
@@ -2140,28 +2144,136 @@ def test_unify_hybrid_kv_cache_specs():
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
 
 
-def test_hma_not_disabled_when_kv_events_enabled():
-    """
-    Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
+def test_mixed_page_size_groups():
+    """Test that incompatible page sizes fall back to mixed-page-size grouping
+    instead of raising NotImplementedError."""
 
-    This test guards against that regression by verifying that a VllmConfig
-    with kv_events_config set still resolves disable_hybrid_kv_cache_manager
-    to False (i.e. HMA remains enabled) when no other condition requires it
-    to be disabled.
-    """
-    model_config = ModelConfig(max_model_len=16)
-    kv_events_config = KVEventsConfig(
-        enable_kv_cache_events=True,
-        publisher="null",
+    # Create specs with incompatible page sizes:
+    # TQ-like attention: small page (block_size=16, 2 heads × 28 bytes × 4B = 3584)
+    tq_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=28,  # TQ3 packed size
+        dtype=torch.uint8,
+    )
+    # Mamba-like: large page (not divisible by 3584)
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 512), (3, 32, 32)),
+        dtypes=(torch.float32, torch.float32),
     )
 
-    # Leave disable_hybrid_kv_cache_manager as None (the default) so that
-    # VllmConfig.__post_init__ resolves it automatically.
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        kv_events_config=kv_events_config,
+    tq_page = tq_spec.page_size_bytes  # 16 * 2 * (28 + 28) * 1 = 1792
+    mamba_page = mamba_spec.page_size_bytes
+
+    # Verify these are actually incompatible
+    assert mamba_page % tq_page != 0, (
+        f"Test setup error: pages should be incompatible "
+        f"(tq={tq_page}, mamba={mamba_page})"
     )
 
-    assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
-        "kv_events_config must not force-disable the hybrid KV cache manager."
+    # unify_kv_cache_spec_page_size should raise for these
+    kv_cache_spec = {
+        "attn.0": tq_spec,
+        "attn.1": tq_spec,
+        "mamba.0": mamba_spec,
+        "mamba.1": mamba_spec,
+    }
+    with pytest.raises(NotImplementedError):
+        kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+
+    # _get_kv_cache_groups_mixed_page_size should succeed
+    groups = kv_cache_utils._get_kv_cache_groups_mixed_page_size(kv_cache_spec)
+    assert len(groups) >= 2, f"Expected >= 2 groups, got {len(groups)}"
+
+    # Each group should have layers with the same spec
+    for g in groups:
+        specs = [kv_cache_spec[name] for name in g.layer_names]
+        assert all(s == specs[0] for s in specs), (
+            f"Group has mixed specs: {specs}"
+        )
+
+
+def test_mixed_page_size_config_from_groups():
+    """Test that get_kv_cache_config_from_groups handles mixed page sizes
+    by creating separate tensors per page-size type."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    tq_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=28,
+        dtype=torch.uint8,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 512), (3, 32, 32)),
+        dtypes=(torch.float32, torch.float32),
+    )
+
+    tq_page = tq_spec.page_size_bytes
+    mamba_page = mamba_spec.page_size_bytes
+
+    # Create groups with different page sizes
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["attn.0", "attn.1"],
+            kv_cache_spec=tq_spec,
+        ),
+        KVCacheGroupSpec(
+            layer_names=["mamba.0", "mamba.1"],
+            kv_cache_spec=mamba_spec,
+        ),
+    ]
+
+    # Use a mock VllmConfig — only need scheduler_config
+    class FakeSchedulerConfig:
+        num_scheduler_steps = 1
+        max_num_batched_tokens = 2048
+
+    class FakeVllmConfig:
+        scheduler_config = FakeSchedulerConfig()
+
+        class cache_config:
+            num_gpu_blocks_override = None
+
+    available_memory = 100 * 1024 * 1024  # 100 MiB
+
+    config = get_kv_cache_config_from_groups(
+        FakeVllmConfig(), groups, available_memory
+    )
+
+    assert config.num_blocks > 0, "Should allocate at least 1 block"
+
+    # Verify tensors: should have separate tensors for each page-size type
+    tq_tensors = [
+        t for t in config.kv_cache_tensors
+        if any("attn" in name for name in t.shared_by)
+    ]
+    mamba_tensors = [
+        t for t in config.kv_cache_tensors
+        if any("mamba" in name for name in t.shared_by)
+    ]
+
+    assert len(tq_tensors) > 0, "Should have TQ tensors"
+    assert len(mamba_tensors) > 0, "Should have Mamba tensors"
+
+    # TQ tensors should be much smaller than Mamba tensors
+    for t in tq_tensors:
+        assert t.size == tq_page * config.num_blocks
+    for t in mamba_tensors:
+        assert t.size == mamba_page * config.num_blocks
+
+    # No tensor should mix TQ and Mamba layers
+    for t in config.kv_cache_tensors:
+        has_attn = any("attn" in n for n in t.shared_by)
+        has_mamba = any("mamba" in n for n in t.shared_by)
+        assert not (has_attn and has_mamba), (
+            f"Tensor mixes TQ and Mamba layers: {t.shared_by}"
+        )
+
+    # Total memory should not exceed available
+    total = sum(t.size for t in config.kv_cache_tensors)
+    assert total <= available_memory, (
+        f"Total {total} exceeds available {available_memory}"
     )

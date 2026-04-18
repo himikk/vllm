@@ -606,4 +606,135 @@ __device__ inline void sub_zp_and_dequant<__nv_fp8x4_e4m3, vllm::kU4.id(),
 
 #endif
 
+// ============================================================
+// INT2 Dequantization (kU2B2: 2-bit unsigned, bias=2)
+// Pack factor: 16 values per int32 (32/2 = 16)
+// Extracts pairs of 2-bit values, converts to FP16/BF16
+// ============================================================
+
+// INT2 → FP16, skip_flop=true (raw extraction, no bias subtraction)
+template <>
+__device__ inline void dequant<half2, vllm::kU2B2.id(), true>(int q,
+                                                              half2* frag_b) {
+  // Extract 2-bit values: 16 values from one int32
+  // We extract in groups of 2 (half2), so 8 half2 outputs
+  const int MASK = 0x00030003;
+  const int EX = 0x64006400;  // FP16 exponent bias (1024.0)
+
+  int v0 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int v1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int v2 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int v3 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+
+  frag_b[0] = *reinterpret_cast<half2*>(&v0);
+  frag_b[1] = *reinterpret_cast<half2*>(&v1);
+  frag_b[2] = *reinterpret_cast<half2*>(&v2);
+  frag_b[3] = *reinterpret_cast<half2*>(&v3);
+}
+
+// INT2 → FP16, skip_flop=false (with bias=2 subtraction: values 0,1,2,3 → -2,-1,0,1)
+template <>
+__device__ inline void dequant<half2, vllm::kU2B2.id(), false>(int q,
+                                                               half2* frag_b) {
+  // First extract raw values
+  dequant<half2, vllm::kU2B2.id(), true>(q, frag_b);
+  // Subtract bias=2 (as FP16: 1024+2 = 0x6402)
+  const int SUB = 0x64026402;
+  frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const half2*>(&SUB));
+  frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const half2*>(&SUB));
+  frag_b[2] = __hsub2(frag_b[2], *reinterpret_cast<const half2*>(&SUB));
+  frag_b[3] = __hsub2(frag_b[3], *reinterpret_cast<const half2*>(&SUB));
+}
+
+// INT2 → BF16, skip_flop=true
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU2B2.id(), true>(
+    int q, nv_bfloat162* frag_b) {
+  // BF16 approach: extract 2-bit values, convert via int→float reinterpret
+  // Add magic number 1024.0 (BF16: 0x4480) to get values in [1024, 1027]
+  const int MASK = 0x00030003;
+  const int EX = 0x44804480;  // BF16 1024.0
+
+  int v0 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int v1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int v2 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int v3 = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+
+  frag_b[0] = *reinterpret_cast<nv_bfloat162*>(&v0);
+  frag_b[1] = *reinterpret_cast<nv_bfloat162*>(&v1);
+  frag_b[2] = *reinterpret_cast<nv_bfloat162*>(&v2);
+  frag_b[3] = *reinterpret_cast<nv_bfloat162*>(&v3);
+}
+
+// INT2 → BF16, skip_flop=false
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU2B2.id(), false>(
+    int q, nv_bfloat162* frag_b) {
+  dequant<nv_bfloat162, vllm::kU2B2.id(), true>(q, frag_b);
+  // Subtract bias=2 (BF16: 1024+2 = 0x44804480 + 2 = 0x44824482)
+  const nv_bfloat162 SUB = {__float2bfloat16(1026.0f), __float2bfloat16(1026.0f)};
+  frag_b[0] = __hsub2(frag_b[0], SUB);
+  frag_b[1] = __hsub2(frag_b[1], SUB);
+  frag_b[2] = __hsub2(frag_b[2], SUB);
+  frag_b[3] = __hsub2(frag_b[3], SUB);
+}
+
+// ============================================================
+// INT3 Dequantization (kU3B4: 3-bit stored in 4-bit slots, bias=4)
+// Packed as INT4 (8 values per int32), but only lower 3 bits used.
+// Values: 0-7, after bias: -4 to 3
+// Uses same extraction as INT4 but clamps to 3-bit range.
+// ============================================================
+
+// INT3 → FP16, skip_flop=true (same as INT4 extraction)
+template <>
+__device__ inline void dequant<half2, vllm::kU3B4.id(), true>(int q,
+                                                              half2* frag_b) {
+  // INT3 packed in INT4 slots — extract as INT4
+  dequant<half2, vllm::kU4B8.id(), true>(q, frag_b);
+}
+
+// INT3 → FP16, skip_flop=false (bias=4 instead of bias=8)
+template <>
+__device__ inline void dequant<half2, vllm::kU3B4.id(), false>(int q,
+                                                               half2* frag_b) {
+  const int LO = 0x000f000f;
+  const int HI = 0x00f000f0;
+  const int EX = 0x64006400;
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  // Bias=4 (not 8 like INT4): subtract 1024+4 = 0x64046404
+  const int SUB = 0x64046404;
+  const int MUL = 0x2c002c00;
+  const int ADD = 0xd400d400;  // -(1024+4)*16 adjusted for hi nibble
+  frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
+                      *reinterpret_cast<const half2*>(&SUB));
+  frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
+                      *reinterpret_cast<const half2*>(&MUL),
+                      *reinterpret_cast<const half2*>(&ADD));
+}
+
+// INT3 → BF16, skip_flop=true
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU3B4.id(), true>(
+    int q, nv_bfloat162* frag_b) {
+  dequant<nv_bfloat162, vllm::kU4B8.id(), true>(q, frag_b);
+}
+
+// INT3 → BF16, skip_flop=false
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU3B4.id(), false>(
+    int q, nv_bfloat162* frag_b) {
+  dequant<nv_bfloat162, vllm::kU3B4.id(), true>(q, frag_b);
+  const nv_bfloat162 SUB = {__float2bfloat16(1028.0f), __float2bfloat16(1028.0f)};
+  frag_b[0] = __hsub2(frag_b[0], SUB);
+  frag_b[1] = __hsub2(frag_b[1], SUB);
+}
+
 }  // namespace MARLIN_NAMESPACE_NAME

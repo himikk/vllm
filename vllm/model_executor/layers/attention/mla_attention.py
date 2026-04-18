@@ -332,12 +332,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             calculate_kv_scales = False
         self.quant_config = quant_config
 
+        # MultiQuant MLA: init buffers, let MULTIQUANT_MLA backend handle cache
+        from vllm.multiquant.registry import is_multiquant_dtype
+        self._mq_enabled = is_multiquant_dtype(kv_cache_dtype)
+        self._mq_cache_dtype = kv_cache_dtype if self._mq_enabled else None
+        if self._mq_enabled:
+            self._init_multiquant_buffers(
+                kv_cache_dtype, self.head_size, prefix)
+            logger.info_once(
+                "MultiQuant Attention: %s — eigenständiger Pfad (kein MLA Backend)",
+                self._mq_cache_dtype,
+            )
+
         dtype = torch.get_default_dtype()
         self.attn_backend = get_attn_backend(
             self.head_size,
             dtype,
             kv_cache_dtype,
-            use_mla=True,
+            # MultiQuant: use_mla=False — Latent treated as normal K/V
+            use_mla=False if self._mq_enabled else True,
             use_sparse=use_sparse,
             num_heads=self.num_heads,
         )
@@ -467,6 +480,39 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             )
         return self._chunked_prefill_workspace_size
+
+    def _init_multiquant_buffers(
+        self, cache_dtype: str, head_size: int, prefix: str
+    ) -> None:
+        """Initialize MultiQuant buffers for MLA latent vector compression."""
+        import re
+        from vllm.multiquant.registry import get_kv_quantizer_config
+
+        mq_config = get_kv_quantizer_config(cache_dtype, head_size)
+        match = re.search(r"layers\.(\d+)", prefix)
+        layer_idx = int(match.group(1)) if match else 0
+        seed = mq_config.seed + layer_idx * 1337
+
+        from vllm.multiquant.shared.qjl import generate_qjl_matrix
+        from vllm.multiquant.shared.centroids import get_centroids
+
+        if cache_dtype.startswith("rq"):
+            from vllm.multiquant.rotorquant.quantizer import generate_rotors
+            self.register_buffer(
+                "_tq_Pi", generate_rotors(head_size, seed=seed))
+        else:
+            from vllm.multiquant.turboquant.quantizer import (
+                generate_rotation_matrix,
+            )
+            self.register_buffer(
+                "_tq_Pi", generate_rotation_matrix(head_size, seed=seed))
+
+        self.register_buffer(
+            "_tq_S", generate_qjl_matrix(head_size, seed=seed + 1))
+        self.register_buffer(
+            "_tq_centroids",
+            get_centroids(head_size, mq_config.mse_bits))
+        self._tq_config = mq_config
 
     def forward(
         self,
@@ -859,6 +905,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # MultiQuant MLA: allocate with packed_size (real compression)
+        if getattr(self, '_mq_enabled', False) and hasattr(self, '_tq_config'):
+            ps = self._tq_config.cache_head_size
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=ps,
+                dtype=torch.uint8,
+                cache_dtype_str=self._mq_cache_dtype,
+            )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )

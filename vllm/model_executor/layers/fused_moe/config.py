@@ -360,6 +360,14 @@ class FusedMoEQuantConfig:
         return self._a1.dtype is None and self._w1.dtype == current_platform.fp8_dtype()
 
     @property
+    def use_int2_w2a16(self) -> bool:
+        return self._a1.dtype is None and self._w1.dtype == "int2"
+
+    @property
+    def use_int3_w3a16(self) -> bool:
+        return self._a1.dtype is None and self._w1.dtype == "int3"
+
+    @property
     def use_int4_w4a16(self) -> bool:
         return self._a1.dtype is None and self._w1.dtype == "int4"
 
@@ -816,6 +824,44 @@ def int4_w4a16_moe_quant_config(
         _a2=FusedMoEQuantDesc(shape=group_shape),
         _w1=FusedMoEQuantDesc("int4", group_shape, w1_scale, None, w1_zp),
         _w2=FusedMoEQuantDesc("int4", group_shape, w2_scale, None, w2_zp),
+    )
+
+
+def int3_w3a16_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_zp: torch.Tensor | None,
+    w2_zp: torch.Tensor | None,
+    block_shape: list[int] | None = None,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for 16-bit float activations and int3 weights.
+    """
+    group_shape = GroupShape(*block_shape) if block_shape is not None else None
+    return FusedMoEQuantConfig(
+        _a1=FusedMoEQuantDesc(shape=group_shape),
+        _a2=FusedMoEQuantDesc(shape=group_shape),
+        _w1=FusedMoEQuantDesc("int3", group_shape, w1_scale, None, w1_zp),
+        _w2=FusedMoEQuantDesc("int3", group_shape, w2_scale, None, w2_zp),
+    )
+
+
+def int2_w2a16_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_zp: torch.Tensor | None,
+    w2_zp: torch.Tensor | None,
+    block_shape: list[int] | None = None,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for 16-bit float activations and int2 weights.
+    """
+    group_shape = GroupShape(*block_shape) if block_shape is not None else None
+    return FusedMoEQuantConfig(
+        _a1=FusedMoEQuantDesc(shape=group_shape),
+        _a2=FusedMoEQuantDesc(shape=group_shape),
+        _w1=FusedMoEQuantDesc("int2", group_shape, w1_scale, None, w1_zp),
+        _w2=FusedMoEQuantDesc("int2", group_shape, w2_scale, None, w2_zp),
     )
 
 

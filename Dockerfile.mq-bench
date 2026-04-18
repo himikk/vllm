@@ -1,0 +1,63 @@
+FROM localhost/vllm-riy-tq
+
+ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
+
+# MultiQuant framework
+COPY vllm/multiquant/ ${VLLM_DST}/multiquant/
+
+# Archer CUDA kernel sources
+COPY kernels/archer/ /opt/archer_build/
+
+# Updated vLLM files (Q5 mixed page-size + Q6 3D fix + M1-M2 multiquant)
+COPY vllm/v1/core/kv_cache_utils.py ${VLLM_DST}/v1/core/kv_cache_utils.py
+COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
+COPY vllm/model_executor/layers/attention/mla_attention.py ${VLLM_DST}/model_executor/layers/attention/mla_attention.py
+COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
+COPY vllm/v1/attention/backends/multiquant_attn.py ${VLLM_DST}/v1/attention/backends/multiquant_attn.py
+COPY vllm/v1/attention/backends/mla/multiquant_mla.py ${VLLM_DST}/v1/attention/backends/mla/multiquant_mla.py
+COPY vllm/v1/attention/backends/registry.py ${VLLM_DST}/v1/attention/backends/registry.py
+# Patch backend.py inline
+RUN sed -i 's/kv_cache_dtype.startswith("tq")/kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")/' ${VLLM_DST}/v1/attention/backend.py
+# Patch cuda.py inline (can't copy — _C_stable_libtorch import chain)
+# MQ backend selection: MLA → MULTIQUANT_MLA, non-MLA → MULTIQUANT
+# Replace the old TQ-only priority with full MQ dispatch
+RUN sed -i 's/kv_cache_dtype.startswith("tq")/kv_cache_dtype.startswith("tq") or kv_cache_dtype.startswith("rq")/' ${VLLM_DST}/platforms/cuda.py \
+ && sed -i 's/return \[AttentionBackendEnum.TURBOQUANT\]/if use_mla:\n            return [AttentionBackendEnum.MULTIQUANT_MLA]\n        return [AttentionBackendEnum.MULTIQUANT, AttentionBackendEnum.TURBOQUANT]/' ${VLLM_DST}/platforms/cuda.py
+COPY vllm/turboquant/__init__.py ${VLLM_DST}/turboquant/__init__.py
+
+# Patch config/cache.py + utils/torch_utils.py inline (can't copy — import chain breaks)
+RUN sed -i 's/"tq4",/"tq4",\n    "rq2",\n    "rq3",\n    "rq4",/' ${VLLM_DST}/config/cache.py
+RUN sed -i 's/"tq4": torch.uint8,/"tq4": torch.uint8,\n    "rq2": torch.uint8,\n    "rq3": torch.uint8,\n    "rq4": torch.uint8,/' ${VLLM_DST}/utils/torch_utils.py
+
+# Register "multiquant" + "autoround_rtn" + "marlin_mq" as valid quantization methods
+RUN sed -i 's/"cpu_awq",/"cpu_awq",\n    "multiquant",\n    "marlin_mq",\n    "autoround_rtn",/' ${VLLM_DST}/model_executor/layers/quantization/__init__.py
+RUN python3 -c "\
+p='${VLLM_DST}/model_executor/layers/quantization/__init__.py';\
+open(p,'a').write(\"\"\"\n\
+try:\n\
+    from vllm.multiquant.weight_quant.config import ArcherConfig as _AC\n\
+    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['multiquant'] = _AC\n\
+except ImportError: pass\n\
+try:\n\
+    from vllm.multiquant.autoround.config import AutoRoundRTNConfig as _ARC\n\
+    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['autoround_rtn'] = _ARC\n\
+except ImportError: pass\n\
+try:\n\
+    from vllm.multiquant.marlin.config import MarlinMultiQuantConfig as _MMC\n\
+    _CUSTOMIZED_METHOD_TO_QUANT_CONFIG['marlin_mq'] = _MMC\n\
+except ImportError: pass\n\
+\"\"\")"
+
+# Tests
+COPY tests/multiquant/ /opt/tests/multiquant/
+COPY tests/turboquant/ /opt/tests/turboquant/
+COPY tests/v1/core/test_kv_cache_utils.py /opt/tests/test_kv_cache_utils.py
+
+# pytest
+RUN pip install --no-cache-dir --break-system-packages pytest
+
+# Cleanup bytecode
+RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+
+# Verify
+RUN python3 -c "from vllm.multiquant import is_multiquant_dtype; assert is_multiquant_dtype('rq3'); print('MultiQuant: OK')"

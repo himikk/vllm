@@ -245,3 +245,9 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+build/wheels/*.whl
+
+# MultiQuant build context
+!build/moe-configs/
+!build/moe-configs/*.json
+build/wheels/

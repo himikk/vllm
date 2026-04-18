@@ -1,0 +1,50 @@
+# XFP v8 bf16-native Kernel Update
+# Basis: vllm-multiquant (hat alles außer die bf16-Änderungen)
+# Kopiert die geänderten Python-Module und CUDA-Kernel rein.
+
+FROM localhost/vllm-multiquant:latest
+
+# XFP Python-Module (bf16-Änderungen)
+COPY vllm/multiquant/xfp/ /usr/local/lib/python3.12/dist-packages/vllm/multiquant/xfp/
+COPY vllm/multiquant/policy.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/policy.py
+COPY vllm/multiquant/weight_cache.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/weight_cache.py
+COPY vllm/multiquant/autoround/config.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/config.py
+COPY vllm/multiquant/fp8_embedding.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_embedding.py
+COPY vllm/multiquant/fp8_linear.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_linear.py
+COPY vllm/multiquant/fp8_moe.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/fp8_moe.py
+COPY vllm/multiquant/autoround/online_moe.py /usr/local/lib/python3.12/dist-packages/vllm/multiquant/autoround/online_moe.py
+COPY vllm/engine/arg_utils.py /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
+
+# GPU model runner (XFP summary trigger)
+COPY vllm/v1/worker/gpu_model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
+
+# Streaming quant-on-load (per-layer quantization during weight loading)
+COPY vllm/model_executor/model_loader/base_loader.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/base_loader.py
+COPY vllm/model_executor/model_loader/utils.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/utils.py
+COPY vllm/model_executor/model_loader/weight_utils.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py
+COPY vllm/model_executor/model_loader/default_loader.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/default_loader.py
+
+# CUDA Kernel Source (für JIT-Kompilierung)
+COPY kernels/multiquant/ /opt/mq_kernels/
+
+# Pre-build XFP CUDA kernels. v12 is the runtime default (static SMEM
+# A-row cache); v11 is retained as the K>K_SMEM_MAX fallback.
+RUN python3 -c "\
+import sys; sys.path.insert(0, '/usr/local/lib/python3.12/dist-packages'); \
+from torch.utils.cpp_extension import load; \
+flags=['-O3', '-std=c++17', '--use_fast_math', \
+       '-gencode=arch=compute_120,code=sm_120', \
+       '-gencode=arch=compute_121,code=sm_121', \
+       '-diag-suppress=177,3288']; \
+k11 = load(name='xfp_gemm_v11', sources=['/opt/mq_kernels/xfp_gemm_v11.cu'], \
+    extra_cuda_cflags=flags, verbose=True); \
+print('XFP Linear v11 compiled:', k11); \
+k12 = load(name='xfp_gemm_v12', sources=['/opt/mq_kernels/xfp_gemm_v12.cu'], \
+    extra_cuda_cflags=flags, verbose=True); \
+print('XFP Linear v12 (SMEM A) compiled:', k12); \
+m11 = load(name='xfp_moe_gemm_v11', sources=['/opt/mq_kernels/xfp_moe_gemm_v11.cu'], \
+    extra_cuda_cflags=flags, verbose=True); \
+print('XFP MoE v11 compiled:', m11); \
+m12 = load(name='xfp_moe_gemm_v12', sources=['/opt/mq_kernels/xfp_moe_gemm_v12.cu'], \
+    extra_cuda_cflags=flags, verbose=True); \
+print('XFP MoE v12 (SMEM A) compiled:', m12)"

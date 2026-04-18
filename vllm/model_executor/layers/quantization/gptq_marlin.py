@@ -96,6 +96,8 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     # (num_bits, is_sym) -> quant_type
     TYPE_MAP = {
+        (2, True): scalar_types.uint2b2,
+        (3, True): scalar_types.uint3b4,
         (4, True): scalar_types.uint4b8,
         (8, True): scalar_types.uint8b128,
     }
@@ -145,7 +147,9 @@ class GPTQMarlinConfig(QuantizationConfig):
         self.weight_bits = weight_bits
         self.is_sym = is_sym
 
-        self.pack_factor = 32 // weight_bits  # packed into int32
+        # INT3 is stored in 4-bit slots (3-in-4), so pack_factor = 8 like INT4
+        effective_bits = 4 if weight_bits == 3 else weight_bits
+        self.pack_factor = 32 // effective_bits  # packed into int32
         self.group_size = group_size
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized

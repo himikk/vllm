@@ -255,6 +255,41 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        # Sub-4-bit (INT2/INT3): MultiQuant fused GEMM kernels.
+        # Uses GPTQLinearMethod's create_weights (shard-fusing) with
+        # our own apply() calling mq_gemm_int2/mq_gemm_int3.
+        if weight_bits < 4:
+            from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+            from vllm.multiquant.weight_quant.mq_sub4_linear import (
+                MQSub4LinearMethod,
+            )
+            gptq_cfg = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                desc_act=False,
+                lm_head_quantized=False,
+                dynamic={},
+            )
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return MQSub4LinearMethod(gptq_cfg)
+            if isinstance(layer, FusedMoE):
+                # MoE sub-4-bit: use MoeWNA16 for loading but override apply()
+                from vllm.model_executor.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
+                moe_cfg = MoeWNA16Config.from_config({
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "sym": sym,
+                    "lm_head": False,
+                })
+                from vllm.multiquant.weight_quant.mq_sub4_moe import (
+                    MQSub4MoEMethod,
+                )
+                return MQSub4MoEMethod(moe_cfg, layer.moe_config)
+            return None
+
         if backend == "auto" or "marlin" in backend:
             AWQ_TYPE_MAP = {
                 4: scalar_types.uint4,
@@ -341,6 +376,38 @@ class INCConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        # Sub-4-bit (INT2/INT3): MultiQuant fused GEMM
+        if weight_bits < 4:
+            from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+            from vllm.multiquant.weight_quant.mq_sub4_linear import (
+                MQSub4LinearMethod,
+            )
+            gptq_cfg = GPTQConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                desc_act=False,
+                lm_head_quantized=False,
+                dynamic={},
+            )
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                return MQSub4LinearMethod(gptq_cfg)
+            if isinstance(layer, FusedMoE):
+                from vllm.model_executor.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
+                moe_cfg = MoeWNA16Config.from_config({
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "sym": sym,
+                    "lm_head": False,
+                })
+                from vllm.multiquant.weight_quant.mq_sub4_moe import (
+                    MQSub4MoEMethod,
+                )
+                return MQSub4MoEMethod(moe_cfg, layer.moe_config)
+            return None
+
         if backend == "auto" or "marlin" in backend:
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,

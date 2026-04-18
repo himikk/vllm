@@ -1,0 +1,21 @@
+FROM localhost/vllm-riy-tq
+
+ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
+
+# Q5: Mixed page-size support + fix attention.py + turboquant backend
+COPY vllm/v1/core/kv_cache_utils.py ${VLLM_DST}/v1/core/kv_cache_utils.py
+COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
+COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
+
+# Tests
+COPY tests/turboquant/ /opt/tests/turboquant/
+COPY tests/v1/core/test_kv_cache_utils.py /opt/tests/test_kv_cache_utils.py
+
+# pytest for testing
+RUN pip install --no-cache-dir --break-system-packages pytest
+
+# Cleanup bytecode
+RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+
+# Verify
+RUN python3 -c "from vllm.v1.core.kv_cache_utils import _get_kv_cache_groups_mixed_page_size; print('Q5 mixed-page-size: OK')"

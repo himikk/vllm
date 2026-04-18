@@ -2710,6 +2710,21 @@ def reshape_and_cache_flash(
     )
 
 
+def turboquant_round_trip(
+    key: torch.Tensor,
+    Pi: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+    output: torch.Tensor,
+    head_size: int,
+    n_centroids: int,
+) -> None:
+    """Fused TurboQuant round-trip: quantize→dequant keys in one CUDA kernel."""
+    torch.ops._C_cache_ops.turboquant_round_trip(
+        key, Pi, S, centroids, output, head_size, n_centroids,
+    )
+
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,

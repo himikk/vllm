@@ -1,804 +1,434 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant attention backend for vLLM.
+"""TurboQuant custom attention backend — compressed uint8 KV-cache.
 
-Prefill: Standard scaled dot-product attention on uncompressed K/V,
-         then quantize K and store K+V into combined cache slot.
-Decode:  Compute TQ attention scores from compressed cache,
-         unpack FP16 values, softmax + weighted sum.
+Standalone backend, does NOT inherit FlashInfer.
+Reads/writes compressed TQ data directly. No shadow cache.
 
-Cache layout (no leading 2 dimension):
-  (num_blocks, block_size, num_kv_heads, slot_size)
-  where slot_size = key_packed_size + value_fp16_size
-
-Per-head per-position slot layout:
-  [key_packed (kps bytes) | value_fp16 (D*2 bytes)]
-  For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
+Cache: (num_blocks, 2, block_size, num_kv_heads, packed_size) uint8
+Decode: compressed score + online softmax + V decompress (Python, CUDA later)
+Prefill: naive causal attention on raw K/V
 """
 
-import functools
 import math
+import struct
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import ClassVar, Optional
 
 import torch
 import torch.nn.functional as F
 
-from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.triton_utils import triton
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
-    AttentionCGSupport,
-    AttentionImpl,
-    AttentionLayer,
     AttentionMetadata,
     AttentionMetadataBuilder,
-    AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.fa_utils import (
-    is_flash_attn_varlen_func_available,
-)
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.triton_turboquant_decode import (
-    _tq_full_dequant_kv,
-    _use_fp8_e4b15,
-    triton_turboquant_decode_attention,
-)
-from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
 
-_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
-if _HAS_FLASH_ATTN:
-    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+try:
+    from vllm.attention import AttentionType
+except ImportError:
+    from vllm.v1.attention.backend import AttentionType
 
-# Continuation prefill: for small continuation chunks (q_len ≤ threshold),
-# use the TQ decode kernel directly instead of full-dequant + flash_attn.
-# do_kv_cache_update already stored all tokens to TQ cache, so the decode
-# kernel can read them efficiently. This avoids O(cached_len) dequant work
-# per continuation, eliminating the O(N²/chunk_size) collapse at long context.
-_CONTINUATION_DECODE_THRESHOLD = 128
+logger = init_logger(__name__)
 
 
-def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
-    """Orthonormal Hadamard matrix (Sylvester construction), cached per (d, device).
+# ============================================================
+# Metadata
+# ============================================================
 
-    Precomputed D×D matrix enables matmul-based WHT — single cuBLAS GEMM
-    instead of log2(D) butterfly kernel launches. 64KB for D=128.
-    """
-    # Normalize device string so "cuda" and "cuda:0" hit the same cache entry.
-    return _build_hadamard_cached(d, str(torch.device(device_str)))
+@dataclass
+class TQMetadata(AttentionMetadata):
+    seq_lens: torch.Tensor          # [batch]
+    block_table: torch.Tensor       # [batch, max_blocks]
+    slot_mapping: torch.Tensor      # [num_tokens]
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+    max_seq_len: int = 0
+    query_start_loc: Optional[torch.Tensor] = None
 
 
-@functools.cache
-def _build_hadamard_cached(d: int, device_str: str) -> torch.Tensor:
-    H = torch.tensor([[1.0]])
-    while H.shape[0] < d:
-        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
-    return (H / math.sqrt(d)).to(torch.device(device_str))
-
+# ============================================================
+# Backend
+# ============================================================
 
 class TurboQuantAttentionBackend(AttentionBackend):
-    """Attention backend using TurboQuant KV-cache compression."""
-
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = False
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [
-        torch.float16,
-        torch.bfloat16,
-    ]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "turboquant_k8v4",
-        "turboquant_4bit_nc",
-        "turboquant_k3v4_nc",
-        "turboquant_3bit_nc",
-    ]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["tq3", "tq4"]
 
     @staticmethod
     def get_name() -> str:
         return "TURBOQUANT"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [16, 32, 64, 128]
+    def get_supported_kernel_block_sizes():
+        return [16, 32, 64]
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         return attn_type == AttentionType.DECODER
 
     @classmethod
-    def supports_per_head_quant_scales(cls) -> bool:
-        return False
-
-    @staticmethod
-    def get_impl_cls() -> type["TurboQuantAttentionImpl"]:
-        return TurboQuantAttentionImpl
-
-    @staticmethod
-    def get_builder_cls() -> type["TurboQuantMetadataBuilder"]:
-        return TurboQuantMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "turboquant_4bit_nc",
-    ) -> tuple[int, ...]:
-        """Combined K+V cache shape — no leading 2 dimension.
-
-        Standard attention backends use (2, num_blocks, block_size, num_kv_heads,
-        head_dim) with a leading 2 to separate K and V. TurboQuant packs K+V
-        into a single interleaved slot per head per position, so the cache is:
-
-            (num_blocks, block_size, num_kv_heads, slot_size_aligned)
-
-        Each slot = [key_packed | value_packed | padding].
-        This is safe because TQ has its own get_kv_cache_shape override and
-        never shares cache tensors with other backends. Layers that fall back
-        to native dtype via kv_cache_dtype_skip_layers get their own
-        standard-shaped cache allocation.
-
-        head_size is the model's real head_dim. slot_size_aligned is computed
-        from the TQ config to ensure correct cache allocation for all head dims.
-        """
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            TurboQuantConfig,
-        )
-
-        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
-        return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
-
-    @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
-        if kv_cache_dtype is None:
-            return False
-        return kv_cache_dtype.startswith("turboquant_")
+    def supports_kv_cache_dtype(cls, kv_cache_dtype=None) -> bool:
+        return kv_cache_dtype in ("tq3", "tq4") if kv_cache_dtype else False
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        # head_size from spec is effective_head_size (padded_slot//2),
-        # not the model's actual head_dim. Accept any positive value.
-        return head_size > 0
+        return True  # packed_size is passed as head_size
+
+    @staticmethod
+    def get_impl_cls():
+        return TurboQuantImpl
+
+    @staticmethod
+    def get_builder_cls():
+        return TQMetadataBuilder
+
+    @staticmethod
+    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size,
+                           cache_dtype_str="tq3"):
+        # head_size is already packed_size from get_kv_cache_spec
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
 
-@dataclass
-class TurboQuantMetadata(AttentionMetadata):
-    """Metadata for TurboQuant attention."""
+# ============================================================
+# Metadata Builder
+# ============================================================
 
-    seq_lens: torch.Tensor  # (num_reqs,) — total context length per request
-    slot_mapping: torch.Tensor  # (num_tokens,) — cache slot for each token
-    block_table: torch.Tensor  # (num_reqs, max_num_blocks)
-    query_start_loc: torch.Tensor  # (num_reqs + 1,) — cu_seqlens for queries
-    num_actual_tokens: int = 0  # actual tokens (excluding padding)
-    max_query_len: int = 0  # longest query in batch
-    max_seq_len: int = 0  # longest context in batch
-    is_prefill: bool = False
-    num_decodes: int = 0  # number of decode requests (first in batch)
-    num_decode_tokens: int = 0  # tokens from decode requests
-
-
-class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
-    """Builds TurboQuantMetadata from scheduler output."""
-
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+class TQMetadataBuilder(AttentionMetadataBuilder[TQMetadata]):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        self.block_size = kv_cache_spec.block_size
 
-    def build_for_cudagraph_capture(
-        self, common_attn_metadata: CommonAttentionMetadata
-    ) -> TurboQuantMetadata:
-        attn_metadata = self.build(0, common_attn_metadata)
-        # Set seq_lens to 1 so CUDA graph capture is fast
-        # (real seq_lens are filled at replay time).
-        attn_metadata.seq_lens.fill_(1)
-        return attn_metadata
+    def reorder_batch(self, input_batch, scheduler_output):
+        return False
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        """Build TurboQuantMetadata from common attention metadata."""
         cam = common_attn_metadata
+        # Determine prefill vs decode
+        num_tokens = cam.num_actual_tokens
+        num_reqs = cam.num_reqs
+        # Heuristic: if max_query_len > 1, there are prefill tokens
+        num_prefill = 0
+        num_decode = num_tokens
+        if cam.max_query_len > 1:
+            num_prefill = num_tokens
+            num_decode = 0
 
-        # With reorder_batch_threshold=1, the model runner guarantees
-        # decodes come first in the batch. split_decodes_and_prefills
-        # finds the boundary (operates on CPU tensors — no GPU sync).
-        assert self.reorder_batch_threshold is not None
-        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
-            cam, decode_threshold=self.reorder_batch_threshold
-        )
-
-        return TurboQuantMetadata(
+        return TQMetadata(
             seq_lens=cam.seq_lens,
-            slot_mapping=cam.slot_mapping,
             block_table=cam.block_table_tensor,
-            query_start_loc=cam.query_start_loc,
-            num_actual_tokens=cam.num_actual_tokens,
-            max_query_len=cam.max_query_len,
+            slot_mapping=cam.slot_mapping,
+            num_prefill_tokens=num_prefill,
+            num_decode_tokens=num_decode,
             max_seq_len=cam.max_seq_len,
-            is_prefill=(cam.max_query_len > 1),
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
+            query_start_loc=cam.query_start_loc,
         )
 
 
-class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
-    """TurboQuant attention implementation.
+# ============================================================
+# Impl
+# ============================================================
 
-    Vectorized PyTorch: batch quantize/store, vectorized bit-unpack
-    decode with einsum scores and value gather.
-    """
+class TurboQuantImpl:
+    """Custom TQ attention — no FlashInfer dependency."""
 
     supports_quant_query_input: bool = False
+    can_return_lse_for_decode: bool = False
 
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int | None = None,
-        alibi_slopes: list[float] | None = None,
-        sliding_window: int | None = None,
-        kv_cache_dtype: str = "auto",
-        logits_soft_cap: float | None = None,
-        attn_type: str = AttentionType.DECODER,
-        kv_sharing_target_layer_name: str | None = None,
-        **kwargs,
-    ):
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        pass
+
+    def __init__(self, num_heads, head_size, scale, num_kv_heads=None,
+                 alibi_slopes=None, sliding_window=None, kv_cache_dtype="tq3",
+                 logits_soft_cap=None, attn_type=AttentionType.DECODER,
+                 kv_sharing_target_layer_name=None, **kwargs):
         self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = scale
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size  # This is the REAL head_dim, not packed
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads or num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            TurboQuantConfig,
-        )
+        from vllm.turboquant.config import TurboQuantConfig
+        self._tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
+        self._packed_size = self._tq_config.key_packed_size
+        self._mse_bits = self._tq_config.mse_bits
+        self._mse_bytes = (head_size * self._mse_bits + 7) // 8
+        self._qjl_bytes = (head_size + 7) // 8
+        self._mask = (1 << self._mse_bits) - 1
+        self._correction = math.sqrt(math.pi / 2) / head_size
 
-        self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
-
-        # Pre-compute kernel constants from config (avoid repeated arithmetic)
-        cfg = self.tq_config
-        self._mse_bytes = (
-            math.ceil(head_size * cfg.key_mse_bits / 8)
-            if not cfg.key_fp8
-            else head_size
-        )
-        self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
-        self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
-
-        # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
-        # and benchmarks show no regression vs dynamic in eager mode).
-        vllm_config = get_current_vllm_config()
-        self.max_num_kv_splits = (
-            vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
-        )
-
-    def _ensure_on_device(self, layer, device):
-        """One-time derivation of TQ buffers (rotation matrices, midpoints).
-
-        Registered buffers (_tq_signs, _tq_centroids) are already on the
-        correct device via register_buffer + model.to(device).
-        """
-        if not hasattr(layer, "_tq_cached"):
-            D = layer._tq_signs.shape[0]
-            signs = layer._tq_signs.to(device=device, dtype=torch.float32)
-
-            # WHT rotation: orthonormal + self-inverse, enabling future
-            # in-kernel butterfly fusion and trivial inverse for continuation.
-            H = _build_hadamard(D, str(device))
-            layer._tq_PiT = (signs.unsqueeze(1) * H).contiguous()
-            layer._tq_Pi = layer._tq_PiT.T.contiguous()
-
-            c = layer._tq_centroids.to(device=device, dtype=torch.float32)
-            # Precompute midpoints for threshold-based quantization
-            c_sorted, _ = c.sort()
-            layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
-            # Decode buffers (_tq_mid_o_buf, _tq_output_buf, _tq_lse_buf)
-            # are pre-allocated via register_buffer in Attention.__init__
-            # and moved to GPU by model.to(device) — no allocation needed
-            # here.  The memory profiler sees them before KV cache sizing.
-            layer._tq_cached = True
-
-    def do_kv_cache_update(
-        self,
-        layer: torch.nn.Module,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Store compressed K/V into the combined TQ cache.
-
-        Called as a separate custom op (unified_kv_cache_update) BEFORE
-        the attention forward, matching FlashAttention's split pattern.
-        slot_mapping is already sliced to num_actual_tokens by the caller.
-        """
-        N = slot_mapping.shape[0]
-        if N <= 0:
+    @torch.compiler.disable
+    @torch.no_grad()
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        """Pack K+V into compressed uint8 cache."""
+        if self.kv_sharing_target_layer_name is not None:
             return
 
+        D = self.head_size
         device = key.device
-        self._ensure_on_device(layer, device)
+        block_size = kv_cache.shape[2]
 
-        k = key[:N].view(N, self.num_kv_heads, self.head_size)
-        v = value[:N].view(N, self.num_kv_heads, self.head_size)
-        self._store_kv(k, v, kv_cache, slot_mapping, layer)
+        Pi, S, centroids = self._get_matrices(layer, device)
 
-    def forward(
-        self,
-        layer: AttentionLayer,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: "TurboQuantMetadata",
-        output: torch.Tensor | None = None,
-        output_scale: torch.Tensor | None = None,
-        output_block_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        num_tokens = query.shape[0]
+        num_tokens, num_heads = key.shape[0], key.shape[1]
+        for i in range(num_tokens):
+            slot = slot_mapping[i].item()
+            if slot < 0:
+                continue
+            bi, bo = slot // block_size, slot % block_size
+            for h in range(num_heads):
+                kv_cache[bi, 0, bo, h, :self._packed_size] = self._pack(
+                    key[i, h], Pi, S, centroids, D)
+                kv_cache[bi, 1, bo, h, :self._packed_size] = self._pack(
+                    value[i, h], Pi, S, centroids, D)
 
-        if output is None:
-            output = torch.zeros(
-                num_tokens,
-                self.num_heads * self.head_size,
-                dtype=query.dtype,
-                device=query.device,
-            )
+    @torch.compiler.disable
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                output=None, output_scale=None, output_block_scale=None):
+        """Decode: compressed attention. Prefill: naive causal."""
+        D = self.head_size
+        N = query.shape[0]
+
+        # vLLM passes 3D tensors [N, heads, D] — flatten to 2D for our logic
+        if query.dim() == 3:
+            query = query.reshape(N, -1)
+        if key is not None and key.dim() == 3:
+            key = key.reshape(key.shape[0], -1)
+        if value is not None and value.dim() == 3:
+            value = value.reshape(value.shape[0], -1)
+
+        output_3d = False
+        if output is not None and output.dim() == 3:
+            output_3d = True
+            out_shape = output.shape
+            # Use view (not reshape) to keep same storage — in-place writes
+            # propagate back to the caller's tensor.
+            output = output.view(N, -1)
+        elif output is None:
+            output = torch.empty(N, self.num_heads * D,
+                                 device=query.device, dtype=query.dtype)
 
         if attn_metadata is None:
+            if output_3d:
+                return output.fill_(0).view(out_shape)
             return output.fill_(0)
 
-        # Slice to actual tokens
-        N = attn_metadata.num_actual_tokens
-        if N <= 0:
-            return output.fill_(0)
-
-        q = query[:N].view(N, self.num_heads, self.head_size)
-
-        # Get TQ buffers, ensure on device (one-time migration).
-        # Use Any-typed alias for dynamic _tq_* attrs set by _ensure_on_device.
-        tq_layer: Any = layer
-        device = q.device
-        self._ensure_on_device(tq_layer, device)
-        Pi = tq_layer._tq_Pi
-        PiT = tq_layer._tq_PiT
-        centroids = tq_layer._tq_centroids
-
-        # Compute attention (KV cache was already updated by do_kv_cache_update)
-        # With reorder_batch_threshold=1, decodes come first in the batch.
-        # num_decodes/num_decode_tokens from metadata give the split point.
-        num_decodes = attn_metadata.num_decodes
-        num_decode_tokens = attn_metadata.num_decode_tokens
-
-        if not attn_metadata.is_prefill:
-            # Pure decode batch — fast path
-            attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
-            )
-        elif num_decodes == 0:
-            # Pure prefill batch
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out = self._prefill_attention(
-                q,
-                k,
-                v,
-                kv_cache,
-                attn_metadata,
-                Pi,
-                centroids,
-                PiT,
-                layer=layer,
-            )
-        else:
-            # Mixed batch: decodes first (guaranteed by reorder_batch).
-            attn_out = torch.zeros(
-                N, self.num_heads, self.head_size, device=device, dtype=q.dtype
-            )
-
-            # --- Decode portion (first num_decodes requests) ---
-            # Use full-batch max_seq_len as safe upper bound (no GPU sync).
-            decode_meta = TurboQuantMetadata(
-                seq_lens=attn_metadata.seq_lens[:num_decodes],
-                slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
-                block_table=attn_metadata.block_table[:num_decodes],
-                query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
-                num_actual_tokens=num_decode_tokens,
-                max_query_len=1,
-                max_seq_len=attn_metadata.max_seq_len,
-                is_prefill=False,
-            )
-            attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
-            )
-
-            # --- Prefill portion (remaining requests) ---
-            # CRITICAL: use prefill-specific max_seq_len so flash_attn's
-            # fast path (max_query_len == max_seq_len) triggers for
-            # first-chunk prefills. Using full-batch max_seq_len breaks
-            # this because decode requests inflate max_seq_len.
-            prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
-            # Use CPU-side max to avoid GPU→CPU sync from .item()
-            prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())
-            prefill_qsl = (
-                attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
-            )
-            prefill_meta = TurboQuantMetadata(
-                seq_lens=prefill_seq_lens,
-                slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
-                block_table=attn_metadata.block_table[num_decodes:],
-                query_start_loc=prefill_qsl,
-                num_actual_tokens=N - num_decode_tokens,
-                max_query_len=attn_metadata.max_query_len,
-                max_seq_len=prefill_max_seq,
-                is_prefill=True,
-            )
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out[num_decode_tokens:] = self._prefill_attention(
-                q[num_decode_tokens:],
-                k[num_decode_tokens:],
-                v[num_decode_tokens:],
-                kv_cache,
-                prefill_meta,
-                Pi,
-                centroids,
-                PiT,
-                layer=layer,
-            )
-
-        # Write into output buffer: attn_out is (N, Hq, D)
-        # output may be 2D (N, Hq*D) or 3D (N, Hq, D)
-        if output.ndim == 3:
-            output[:N] = attn_out.to(output.dtype)
-        else:
-            output[:N] = attn_out.reshape(N, -1).to(output.dtype)
-        return output
-
-    # ------------------------------------------------------------------ #
-    #  Store K/V into combined cache (vectorized)                         #
-    # ------------------------------------------------------------------ #
-    def _store_kv(
-        self,
-        key: torch.Tensor,  # (N, Hk, D)
-        value: torch.Tensor,  # (N, Hk, D)
-        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
-        slot_mapping: torch.Tensor,
-        layer: Any,
-    ):
-        """Quantize + store via fused Triton kernel."""
-        triton_turboquant_store(
-            key,
-            value,
-            kv_cache,
-            slot_mapping,
-            layer._tq_PiT,
-            layer._tq_midpoints,
-            mse_bits=self.tq_config.key_mse_bits,
-            key_packed_size=self.tq_config.key_packed_size,
-            value_quant_bits=self.tq_config.effective_value_quant_bits,
-            key_fp8=self.tq_config.key_fp8,
-        )
-
-    # ------------------------------------------------------------------ #
-    #  Prefill: SDPA on raw Q/K/V with causal mask                        #
-    # ------------------------------------------------------------------ #
-    def _prefill_attention(
-        self,
-        query: torch.Tensor,  # (N, Hq, D)
-        key: torch.Tensor,  # (N, Hk, D)
-        value: torch.Tensor,  # (N, Hk, D)
-        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
-        attn_metadata: TurboQuantMetadata,
-        Pi: torch.Tensor,
-        centroids: torch.Tensor,
-        PiT: torch.Tensor | None = None,
-        layer: Any = None,
-    ) -> torch.Tensor:
-        N, Hq, D = query.shape
-
-        # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
-        # max_query_len == max_seq_len means no request has prior cached KV.
-        # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
-            return flash_attn_varlen_func(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.max_query_len,
-                softmax_scale=self.scale,
-                causal=True,
-            )
-
-        # Continuation or no flash_attn: per-request attention.
-        # For continuation chunks (seq_len > q_len), we must attend to
-        # previously cached K/V from the TQ cache, not just the current
-        # chunk's raw K/V.
-        Hk = key.shape[1]
-        use_gqa = Hk < Hq
-        query_start_loc = attn_metadata.query_start_loc
-        num_reqs = query_start_loc.shape[0] - 1
-
-        output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
-
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
-        qsl = query_start_loc.tolist()
-        seq_lens_list = attn_metadata.seq_lens.tolist()
-
-        # Pre-allocate cu_seqlens for single-request flash_attn calls
-        # to avoid per-request host→device tensor creation.
-        _cu_2 = torch.zeros(2, device=query.device, dtype=torch.int32)
-
-        for i in range(num_reqs):
-            q_start = qsl[i]
-            q_end = qsl[i + 1]
-            q_len = q_end - q_start
-            if q_len <= 0:
-                continue
-
-            seq_len = seq_lens_list[i]
-            q_seq = query[q_start:q_end]  # (q_len, Hq, D)
-            k_seq = key[q_start:q_end]  # (q_len, Hk, D)
-            v_seq = value[q_start:q_end]  # (q_len, Hk, D)
-
-            if q_len == seq_len:
-                # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN:
-                    _cu_2[1] = q_len
-                    cu = _cu_2
-                    out = flash_attn_varlen_func(
-                        q=q_seq,
-                        k=k_seq,
-                        v=v_seq,
-                        cu_seqlens_q=cu,
-                        cu_seqlens_k=cu,
-                        max_seqlen_q=q_len,
-                        max_seqlen_k=q_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                    )
-                else:
-                    q_t = q_seq.transpose(0, 1).contiguous()
-                    k_t = k_seq.transpose(0, 1).contiguous()
-                    v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
-                output[q_start:q_end] = out.to(query.dtype)
-            else:
-                # Continuation chunk: tokens already stored to TQ cache
-                # by do_kv_cache_update. Use decode kernel directly to
-                # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
-                cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
-                    # Fast path: treat each query as a decode request
-                    # with incremental seq_lens for causal masking.
-                    synth_seq_lens = torch.arange(
-                        cached_len + 1,
-                        seq_len + 1,
-                        device=query.device,
-                        dtype=attn_metadata.seq_lens.dtype,
-                    )
-                    synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    out = triton_turboquant_decode_attention(
-                        query=q_seq,
-                        kv_cache=kv_cache,
-                        block_table=synth_bt,
-                        seq_lens=synth_seq_lens,
-                        Pi=Pi,
-                        centroids=centroids,
-                        scale=self.scale,
-                        mse_bits=self.tq_config.key_mse_bits,
-                        key_packed_size=self.tq_config.key_packed_size,
-                        value_quant_bits=(self.tq_config.effective_value_quant_bits),
-                        key_fp8=self.tq_config.key_fp8,
-                        norm_correction=self.tq_config.norm_correction,
-                        PiT=PiT,
-                    )
-                else:
-                    # Large continuation: dequant cached K/V and use
-                    # flash_attn for better throughput.
-                    out = self._continuation_prefill(
-                        layer,
-                        q_seq,
-                        k_seq,
-                        v_seq,
-                        kv_cache,
-                        attn_metadata.block_table[i : i + 1],
-                        cached_len,
-                        seq_len,
-                        Pi,
-                        centroids,
-                    )
-                output[q_start:q_end] = out.to(query.dtype)
-
-        return output
-
-    def _continuation_prefill(
-        self,
-        layer: Any,
-        query: torch.Tensor,  # (q_len, Hq, D)
-        key_chunk: torch.Tensor,  # (q_len, Hk, D)
-        val_chunk: torch.Tensor,  # (q_len, Hk, D)
-        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
-        block_table: torch.Tensor,  # (1, max_num_blocks)
-        cached_len: int,
-        seq_len: int,
-        Pi: torch.Tensor,
-        centroids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Handle continuation chunk by dequanting cached K/V from TQ cache.
-
-        Dequants previously cached K/V, concatenates with the current
-        chunk's raw K/V, then runs flash_attn with causal masking.
-        """
-        q_len, Hq, D = query.shape
-        Hk = key_chunk.shape[1]
         device = query.device
-        block_size = kv_cache.shape[1]
-        BLOCK_D = triton.next_power_of_2(D)
+        Pi, S, centroids = self._get_matrices(layer, device)
+        block_size = kv_cache.shape[2]
 
-        mse_bytes = self._mse_bytes
-        val_data_bytes = self._val_data_bytes
+        num_prefill = attn_metadata.num_prefill_tokens
+        num_decode = attn_metadata.num_decode_tokens
 
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid.
-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        buf_shape = (1, Hk, alloc_len, D)
-        k_buf = getattr(layer, "_tq_k_dequant_buf", None)
-        if k_buf is None or k_buf.shape[2] < alloc_len:
-            k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            layer._tq_k_dequant_buf = k_buf
-            layer._tq_v_dequant_buf = v_buf
-        else:
-            v_buf = layer._tq_v_dequant_buf
-        k_cached = k_buf[:, :, :alloc_len, :].zero_()
-        v_cached = v_buf[:, :, :alloc_len, :].zero_()
+        # --- Prefill: naive causal on raw K/V ---
+        if num_prefill > 0:
+            pq = query[num_decode:].reshape(-1, self.num_heads, D)
+            pk = key[num_decode:].reshape(-1, self.num_kv_heads, D)
+            pv = value[num_decode:].reshape(-1, self.num_kv_heads, D)
 
-        grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids,
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-            num_warps=4,
-        )
+            if self.num_kv_groups > 1:
+                pk = pk.repeat_interleave(self.num_kv_groups, dim=1)
+                pv = pv.repeat_interleave(self.num_kv_groups, dim=1)
 
-        # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
-            k_flat = k_flat @ Pi
-            k_cached_trim = (
-                k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
-            )  # (cached_len, Hk, D)
-        else:
-            k_cached_trim = (
-                k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-            )  # (cached_len, Hk, D)
+            L = pq.shape[0]
+            scores = torch.bmm(
+                pq.transpose(0, 1).float(),
+                pk.transpose(0, 1).float().transpose(-2, -1)
+            ) * self.scale
+            causal_mask = torch.triu(
+                torch.full((L, L), float('-inf'), device=device), diagonal=1)
+            scores = scores + causal_mask.unsqueeze(0)
+            weights = F.softmax(scores, dim=-1)
+            prefill_out = torch.bmm(weights, pv.transpose(0, 1).float())
+            output[num_decode:] = prefill_out.transpose(0, 1).reshape(
+                num_prefill, -1).to(output.dtype)
 
-        v_cached_trim = (
-            v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-        )  # (cached_len, Hk, D)
+        # --- Decode: vectorized GPU attention from packed cache ---
+        if num_decode > 0:
+            dq = query[:num_decode].reshape(num_decode, self.num_heads, D)
+            seq_lens = attn_metadata.seq_lens[:num_decode]
+            block_table = attn_metadata.block_table[:num_decode]
 
-        # Concatenate cached + current chunk K/V (match query dtype)
-        qdtype = query.dtype
-        k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
-        v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
+            for qi in range(num_decode):
+                sl = seq_lens[qi].item()
+                if sl <= 0:
+                    continue
 
-        # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
-            cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
-            cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
-            return flash_attn_varlen_func(
-                q=query,
-                k=k_full,
-                v=v_full,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=q_len,
-                max_seqlen_k=seq_len,
-                softmax_scale=self.scale,
-                causal=True,
-            )
-        else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+                # Gather all K+V packed data for this sequence
+                # Build flat index into kv_cache
+                positions = torch.arange(sl, device=device)
+                bi_log = positions // block_size
+                bo = positions % block_size
+                bi_phys = block_table[qi, bi_log.long()]  # (sl,)
 
-    # ------------------------------------------------------------------ #
-    #  Decode: Triton TQ decode attention                                 #
-    # ------------------------------------------------------------------ #
-    def _decode_attention(
-        self,
-        query: torch.Tensor,  # (B, Hq, D)
-        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
-        attn_metadata: TurboQuantMetadata,
-        Pi: torch.Tensor,
-        centroids: torch.Tensor,
-        PiT: torch.Tensor | None = None,
-        layer: torch.nn.Module | None = None,
-    ) -> torch.Tensor:
-        # Grab cached decode buffers from the layer (lazily allocated).
-        mid_o_buf = output_buf = lse_buf = None
-        if layer is not None:
-            mid_o_buf = getattr(layer, "_tq_mid_o_buf", None)
-            output_buf = getattr(layer, "_tq_output_buf", None)
-            lse_buf = getattr(layer, "_tq_lse_buf", None)
+                for kv_h in range(self.num_kv_heads):
+                    # Gather packed K: (sl, packed_size)
+                    k_packed = kv_cache[bi_phys, 0, bo, kv_h]  # (sl, packed_size)
+                    v_packed = kv_cache[bi_phys, 1, bo, kv_h]  # (sl, packed_size)
 
-        result = triton_turboquant_decode_attention(
-            query=query,
-            kv_cache=kv_cache,
-            block_table=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
-            Pi=Pi,
-            centroids=centroids,
-            scale=self.scale,
-            mse_bits=self.tq_config.key_mse_bits,
-            key_packed_size=self.tq_config.key_packed_size,
-            value_quant_bits=self.tq_config.effective_value_quant_bits,
-            key_fp8=self.tq_config.key_fp8,
-            norm_correction=self.tq_config.norm_correction,
-            PiT=PiT,
-            mid_o_buf=mid_o_buf,
-            output_buf=output_buf,
-            lse_buf=lse_buf,
-            buf_holder=layer,
-            max_num_kv_splits=self.max_num_kv_splits,
-        )
-        return result
+                    # Vectorized unpack K → compute scores
+                    # Unpack MSE indices: 2 bits per coord, 4 per byte
+                    k_bytes = k_packed[:, :self._mse_bytes]  # (sl, mse_bytes)
+                    # Expand bytes to indices
+                    idx_all = torch.zeros(sl, D, dtype=torch.long, device=device)
+                    for b in range(self._mse_bytes):
+                        bv = k_bytes[:, b].long()  # (sl,)
+                        for k in range(4):
+                            j = b * 4 + k
+                            if j >= D: break
+                            idx_all[:, j] = (bv >> (k * 2)) & self._mask
+
+                    # Unpack signs
+                    s_bytes = k_packed[:, self._mse_bytes:self._mse_bytes + self._qjl_bytes]
+                    signs_all = torch.zeros(sl, D, dtype=torch.float32, device=device)
+                    for b in range(self._qjl_bytes):
+                        bv = s_bytes[:, b].long()
+                        for k in range(8):
+                            j = b * 8 + k
+                            if j >= D: break
+                            signs_all[:, j] = torch.where(
+                                ((bv >> k) & 1).bool(),
+                                torch.ones(sl, device=device),
+                                -torch.ones(sl, device=device))
+
+                    # Unpack norms
+                    no = self._mse_bytes + self._qjl_bytes
+                    vn_bytes = k_packed[:, no:no+2].contiguous()
+                    rn_bytes = k_packed[:, no+2:no+4].contiguous()
+                    k_vn = vn_bytes.view(torch.float16).float().squeeze(-1)  # (sl,)
+                    k_rn = rn_bytes.view(torch.float16).float().squeeze(-1)
+
+                    # Centroids lookup: (sl, D)
+                    c_idx = centroids[idx_all]  # (sl, D)
+
+                    # For each Q head that maps to this KV head
+                    for h in range(kv_h * self.num_kv_groups,
+                                   (kv_h + 1) * self.num_kv_groups):
+                        q_rot_h = dq[qi, h].float() @ Pi.T  # (D,)
+                        q_proj_h = dq[qi, h].float() @ S.T
+
+                        # Term 1: (sl,) = sum over D of q_rot * centroids[idx]
+                        term1 = (q_rot_h.unsqueeze(0) * c_idx).sum(-1)  # (sl,)
+                        # Term 2: (sl,)
+                        term2 = (q_proj_h.unsqueeze(0) * signs_all).sum(-1)
+                        # Score
+                        scores = k_vn * (term1 + self._correction * k_rn * term2) * self.scale
+
+                        # Decompress V: same process
+                        v_idx = torch.zeros(sl, D, dtype=torch.long, device=device)
+                        for b in range(self._mse_bytes):
+                            bv = v_packed[:, b].long()
+                            for k in range(4):
+                                j = b * 4 + k
+                                if j >= D: break
+                                v_idx[:, j] = (bv >> (k * 2)) & self._mask
+                        v_signs = torch.zeros(sl, D, dtype=torch.float32, device=device)
+                        for b in range(self._qjl_bytes):
+                            bv = v_packed[:, self._mse_bytes + b].long()
+                            for k in range(8):
+                                j = b * 8 + k
+                                if j >= D: break
+                                v_signs[:, j] = torch.where(
+                                    ((bv >> k) & 1).bool(),
+                                    torch.ones(sl, device=device),
+                                    -torch.ones(sl, device=device))
+                        v_vn_bytes = v_packed[:, no:no+2].contiguous()
+                        v_rn_bytes = v_packed[:, no+2:no+4].contiguous()
+                        v_vn = v_vn_bytes.view(torch.float16).float().squeeze(-1)
+                        v_rn = v_rn_bytes.view(torch.float16).float().squeeze(-1)
+                        v_c = centroids[v_idx]
+                        v_xm = v_c @ Pi  # (sl, D)
+                        v_xq = self._correction * v_rn.unsqueeze(-1) * (v_signs @ S)
+                        v_recon = v_vn.unsqueeze(-1) * (v_xm + v_xq)  # (sl, D)
+
+                        # Softmax + weighted V
+                        weights = F.softmax(scores, dim=-1)  # (sl,)
+                        out_h = (weights.unsqueeze(-1) * v_recon).sum(0)  # (D,)
+                        output[qi, h * D:(h + 1) * D] = out_h.to(output.dtype)
+
+        if output_3d:
+            return output.view(out_shape)
+        return output
+
+    # --- Helpers ---
+
+    def _get_matrices(self, layer, device):
+        if not hasattr(layer, '_tq_Pi_f32'):
+            layer._tq_Pi_f32 = layer._tq_Pi.to(device).float().contiguous()
+            layer._tq_S_f32 = layer._tq_S.to(device).float().contiguous()
+            layer._tq_c_f32 = layer._tq_centroids.to(device).float().contiguous()
+        return layer._tq_Pi_f32, layer._tq_S_f32, layer._tq_c_f32
+
+    def _pack(self, vec, Pi, S, centroids, D):
+        x = vec.float(); vn = x.norm(); xh = x / (vn + 1e-8)
+        rot = xh @ Pi.T
+        idx = (rot.unsqueeze(-1) - centroids).abs().argmin(dim=-1).to(torch.uint8)
+        xm = centroids[idx.long()] @ Pi; r = xh - xm; rn = r.norm()
+        signs = (r @ S.T >= 0).to(torch.uint8)
+
+        packed = torch.zeros(self._packed_size, dtype=torch.uint8, device=vec.device)
+        if self._mse_bits == 2:
+            for j in range(0, D, 4):
+                v = 0
+                for k in range(min(4, D - j)):
+                    v |= (idx[j+k].item() & 0x3) << (k*2)
+                packed[j//4] = v
+        for j in range(0, D, 8):
+            v = 0
+            for k in range(min(8, D - j)):
+                v |= (signs[j+k].item() & 1) << k
+            packed[self._mse_bytes + j//8] = v
+        no = self._mse_bytes + self._qjl_bytes
+        packed[no:no+2] = vn.half().reshape(1).view(torch.uint8)
+        packed[no+2:no+4] = rn.half().reshape(1).view(torch.uint8)
+        return packed
+
+    def _score_packed(self, q_rot, q_proj, packed, centroids):
+        D = self.head_size
+        t1 = 0.0
+        if self._mse_bits == 2:
+            for b in range(self._mse_bytes):
+                bv = packed[b].item()
+                for k in range(4):
+                    j = b*4+k
+                    if j >= D: break
+                    t1 += q_rot[j].item() * centroids[(bv >> (k*2)) & self._mask].item()
+        t2 = 0.0
+        for b in range(self._qjl_bytes):
+            bv = packed[self._mse_bytes + b].item()
+            for k in range(8):
+                j = b*8+k
+                if j >= D: break
+                t2 += q_proj[j].item() * (1.0 if ((bv >> k) & 1) else -1.0)
+        no = self._mse_bytes + self._qjl_bytes
+        vn = struct.unpack('e', bytes([packed[no].item(), packed[no+1].item()]))[0]
+        rn = struct.unpack('e', bytes([packed[no+2].item(), packed[no+3].item()]))[0]
+        return vn * (t1 + self._correction * rn * t2) * self.scale
+
+    def _unpack(self, packed, Pi, S, centroids):
+        D = self.head_size
+        idx = torch.zeros(D, dtype=torch.long, device=packed.device)
+        if self._mse_bits == 2:
+            for j in range(D):
+                b, k = j//4, j%4
+                idx[j] = (packed[b].item() >> (k*2)) & self._mask
+        signs = torch.zeros(D, dtype=torch.float32, device=packed.device)
+        for j in range(D):
+            b, k = j//8, j%8
+            signs[j] = 1.0 if ((packed[self._mse_bytes+b].item() >> k) & 1) else -1.0
+        no = self._mse_bytes + self._qjl_bytes
+        vn = struct.unpack('e', bytes([packed[no].item(), packed[no+1].item()]))[0]
+        rn = struct.unpack('e', bytes([packed[no+2].item(), packed[no+3].item()]))[0]
+        c_idx = centroids[idx]
+        xm = c_idx @ Pi
+        xq = self._correction * rn * (signs @ S)
+        return vn * (xm + xq)

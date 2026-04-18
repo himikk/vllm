@@ -1,0 +1,32 @@
+FROM localhost/vllm-ng17e-riy
+
+ENV VLLM_DST=/usr/local/lib/python3.12/dist-packages/vllm
+
+# 1. TQ Python module + attention backend + attention layer
+COPY vllm/turboquant/ ${VLLM_DST}/turboquant/
+COPY vllm/v1/attention/backends/turboquant_attn.py ${VLLM_DST}/v1/attention/backends/turboquant_attn.py
+COPY vllm/model_executor/layers/attention/attention.py ${VLLM_DST}/model_executor/layers/attention/attention.py
+
+# 2. CUDA kernel sources
+COPY csrc/quantization/turboquant/ /opt/tq_build/
+COPY csrc/quantization/turboquant/tq_ext.cu /opt/tq_build/tq_ext.cu
+
+# 3. Patch script
+COPY tests/turboquant/patch_v4.py /opt/patch_v4.py
+RUN python3 /opt/patch_v4.py
+
+# 4. Dependencies
+RUN pip install --no-cache-dir --break-system-packages scipy
+
+# 5. Pre-build JIT extension
+RUN python3 -c "from torch.utils.cpp_extension import load; \
+tq = load(name='tq_serve', \
+    sources=['/opt/tq_build/tq_ext.cu', '/opt/tq_build/tq_round_trip.cu'], \
+    extra_cuda_cflags=['-O3', '-std=c++17', '--expt-relaxed-constexpr', '--use_fast_math', \
+                       '-gencode=arch=compute_121,code=sm_121', '-diag-suppress=177,3288'], \
+    extra_include_paths=['/opt/tq_build'], verbose=True); \
+print('Built:', tq)"
+
+# 6. Verify + cleanup
+RUN python3 -c "from vllm.config.cache import CacheDType; print('tq3:', 'tq3' in str(CacheDType))"
+RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true

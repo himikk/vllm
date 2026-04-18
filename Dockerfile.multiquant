@@ -1,0 +1,154 @@
+# ============================================================
+# vllm-multiquant — Full build from our fork
+#
+# Source: flash7777/vllm branch multiquant
+# Contains: vLLM 0.17 + RIY + MultiQuant + Marlin SM12x + all fixes
+#
+# No patches, no sed, no build/deps — everything is in the source tree.
+# Only external deps: CUTLASS, FlashInfer wheels, MoE configs.
+#
+# Build: ./build.sh (empfohlen, mit pip/ccache/cutlass Cache)
+# Caches unter /data/sources/{pip-cache,ccache,torch-extensions,cutlass}
+# ============================================================
+
+ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.02-py3
+FROM ${BASE_IMAGE}
+
+ARG CUDA_ARCHS="12.0a;12.1a"
+ARG VLLM_BRANCH=multiquant
+ARG MAX_JOBS=16
+
+# ─── System deps + ccache ────────────────────────────────────
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends wget libibverbs-dev ccache && \
+    ln -sf libibverbs.so.1 /usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs.so && \
+    ARCH_DIR=$(dpkg --print-architecture | sed 's/arm64/sbsa/;s/amd64/x86_64/') && \
+    wget -qO /tmp/cuda-keyring.deb \
+      "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH_DIR}/cuda-keyring_1.1-1_all.deb" && \
+    dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      libcusparse-dev-13-1 libcusolver-dev-13-1 libcufft-dev-13-1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# ccache for nvcc/gcc — persistent via volume mount (-v /data/sources/ccache:/ccache:rw)
+ENV CCACHE_DIR=/ccache
+ENV CMAKE_C_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+RUN pip install --cache-dir /pip-cache cmake ninja setuptools-scm scipy pytest
+
+# Save NVIDIA's CUDA-aware PyTorch before anything overwrites it
+RUN cd /usr/local/lib/python3.12/dist-packages && \
+    tar cf /opt/nvidia-torch.tar torch/ $(ls -d torch*.dist-info 2>/dev/null)
+
+# ─── CUTLASS 4.4.1 (SM120a/SM121a) ──────────────────────────
+# Use local mount if available (-v cutlass:/opt/cutlass-local:ro), else clone
+RUN if [ -d /opt/cutlass-local/include ]; then \
+      ln -s /opt/cutlass-local /opt/cutlass && echo "CUTLASS: local mount"; \
+    else \
+      git clone --depth 1 --branch v4.4.1 \
+        https://github.com/NVIDIA/cutlass.git /opt/cutlass && echo "CUTLASS: cloned"; \
+    fi
+ENV VLLM_CUTLASS_SRC_DIR=/opt/cutlass
+RUN sed -i '/nvidia-cutlass-dsl/d' /etc/pip/constraint.txt && \
+    pip install --cache-dir /pip-cache --force-reinstall nvidia-cutlass-dsl==4.4.1
+
+# ─── vLLM from OUR FORK (everything included) ───────────────
+RUN git clone --filter=blob:none --branch ${VLLM_BRANCH} \
+      https://github.com/flash7777/vllm.git /tmp/vllm-build
+WORKDIR /tmp/vllm-build
+
+# Use existing PyTorch, remove flashinfer pin
+RUN python use_existing_torch.py
+RUN sed -i '/flashinfer-python/d' requirements/cuda.txt 2>/dev/null || true && \
+    sed -i '/flashinfer-python/d' pyproject.toml 2>/dev/null || true
+RUN pip install --cache-dir /pip-cache -r requirements/build.txt
+
+# Remove container's pre-installed vLLM
+RUN pip uninstall -y vllm
+
+# Build vLLM from our fork
+ENV TORCH_CUDA_ARCH_LIST=${CUDA_ARCHS}
+ENV VLLM_TARGET_DEVICE=cuda
+ENV MAX_JOBS=${MAX_JOBS}
+RUN SETUPTOOLS_SCM_PRETEND_VERSION=0.17.1 pip install --no-build-isolation --cache-dir /pip-cache .
+
+# Save our source files that aren't part of pip install
+# (multiquant, turboquant, csrc kernels, tests)
+RUN mkdir -p /opt/tests && \
+    cp -r vllm/multiquant /usr/local/lib/python3.12/dist-packages/vllm/multiquant && \
+    cp -r vllm/turboquant /usr/local/lib/python3.12/dist-packages/vllm/turboquant && \
+    cp -r kernels/turboquant /opt/tq_build && \
+    cp -r kernels/archer /opt/archer_build && \
+    cp -r tests/multiquant /opt/tests/multiquant && \
+    cp -r tests/turboquant /opt/tests/turboquant && \
+    echo "Fused decode kernel:" && \
+    ls /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/triton_mq_fused_decode.py && \
+    git rev-parse --short HEAD > /opt/vllm-commit && \
+    echo "Commit: $(cat /opt/vllm-commit)"
+
+WORKDIR /
+RUN rm -rf /tmp/vllm-build
+
+# ─── FlashInfer 0.6.6 + NVIDIA SM120 cubins ──────────────────
+# Save NVIDIA's pre-built cubins (SM120/SM121) before upgrading
+RUN cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /opt/flashinfer_cubin_backup
+# Upgrade to 0.6.6 (required by vLLM 0.17)
+RUN pip install --cache-dir /pip-cache --retries 10 flashinfer-python==0.6.6
+# Restore NVIDIA cubins (version mismatch bypassed at runtime)
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer_cubin && \
+    cp -r /opt/flashinfer_cubin_backup /usr/local/lib/python3.12/dist-packages/flashinfer_cubin && \
+    rm -rf /opt/flashinfer_cubin_backup
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
+
+# ─── fastsafetensors + Ray ───────────────────────────────────
+RUN pip install --cache-dir /pip-cache fastsafetensors ray[default] nvidia-nvshmem-cu13
+# Restore NVIDIA CUDA torch (pip may have downgraded it)
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/torch && \
+    tar xf /opt/nvidia-torch.tar -C /usr/local/lib/python3.12/dist-packages/
+# Fix: NVIDIA torch lacks torch._opaque_base — patch vLLM to use try/except
+RUN python3 -c "\
+p='/usr/local/lib/python3.12/dist-packages/vllm/utils/torch_utils.py'; \
+t=open(p).read(); \
+old='HAS_OPAQUE_TYPE = is_torch_equal_or_newer(\"2.11.0.dev\")\n\nif HAS_OPAQUE_TYPE:\n    from torch._opaque_base import OpaqueBase\nelse:\n    OpaqueBase = object'; \
+new='try:\n    from torch._opaque_base import OpaqueBase\n    HAS_OPAQUE_TYPE = True\nexcept (ImportError, ModuleNotFoundError):\n    OpaqueBase = object\n    HAS_OPAQUE_TYPE = False'; \
+assert old in t, 'patch target not found'; \
+open(p,'w').write(t.replace(old,new)); \
+print('torch_utils.py patched')"
+
+# ─── transformers 5.x ────────────────────────────────────────
+RUN pip install --cache-dir /pip-cache --no-deps "transformers>=5.2" && \
+    pip install --cache-dir /pip-cache --upgrade "huggingface_hub>=0.32" && \
+    pip install --cache-dir /pip-cache --no-deps "compressed-tensors>=0.13"
+
+# ─── Pre-build TQ CUDA kernel ───────────────────────────────
+RUN python3 -c "from torch.utils.cpp_extension import load; \
+tq = load(name='tq_serve', \
+    sources=['/opt/tq_build/tq_ext.cu', '/opt/tq_build/tq_round_trip.cu'], \
+    extra_cuda_cflags=['-O3', '-std=c++17', '--expt-relaxed-constexpr', '--use_fast_math', \
+                       '-gencode=arch=compute_120,code=sm_120', '-gencode=arch=compute_121,code=sm_121', '-diag-suppress=177,3288'], \
+    extra_include_paths=['/opt/tq_build'], verbose=True); \
+print('TQ kernel:', tq)"
+
+# ─── MoE Configs ──────────────────────────────────────────────
+RUN mkdir -p /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs
+COPY build/moe-configs/*.json /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/
+
+# ─── Runtime defaults ────────────────────────────────────────
+ENV FLASHINFER_CUDA_ARCH_LIST="12.0a 12.1a"
+ENV RAY_memory_monitor_refresh_ms=0
+ENV RAY_object_store_memory=1073741824
+
+# cv2/typing shadow fix
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/cv2/typing 2>/dev/null || true
+
+# ─── Cleanup ─────────────────────────────────────────────────
+RUN find /usr/local/lib/python3.12 -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+
+# ─── Verify ──────────────────────────────────────────────────
+# torch._opaque_base not in NVIDIA torch at build time; full verify at runtime
+RUN ls /usr/local/lib/python3.12/dist-packages/vllm/multiquant/__init__.py && \
+    ls /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/riy.py && \
+    echo "Build OK: multiquant + riy present"

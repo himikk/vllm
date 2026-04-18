@@ -1,0 +1,45 @@
+#!/bin/bash
+# Qwen3.5-35B + TurboQuant TQ3/TQ4 KV-Cache
+# Image: vllm-riy-tq-bm (ng17e-riy → riy-tq → riy-tq-bm)
+#
+# Usage:
+#   ./start.tq-bm.qwen35                # TQ3 (default)
+#   ./start.tq-bm.qwen35 tq4            # TQ4
+#   ./start.tq-bm.qwen35 fp8            # FP8 baseline
+
+set -euo pipefail
+
+KV_DTYPE="${1:-tq3}"
+MODEL="/data/tensordata/Qwen3.5-35B-A3B-int4-AutoRound"
+NAME="tq-bm-qwen35"
+IMAGE="localhost/vllm-riy-tq-bm"
+PORT=8011
+
+echo "=== Qwen3.5-35B + ${KV_DTYPE} KV-Cache ==="
+
+podman stop "$NAME" 2>/dev/null || true
+podman rm "$NAME" 2>/dev/null || true
+
+podman run -d \
+  --name "$NAME" \
+  --device nvidia.com/gpu=all \
+  --security-opt=label=disable \
+  --hooks-dir=/usr/share/containers/oci/hooks.d \
+  -p ${PORT}:8000 \
+  -v /data/tensordata:/data/tensordata \
+  -e TORCH_CUDNN_V8_API_DISABLED=1 \
+  "$IMAGE" \
+  vllm serve "$MODEL" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --served-model-name "qwen35-35b-${KV_DTYPE}" \
+    --gpu-memory-utilization 0.05 \
+    --kv-cache-memory-bytes 10G \
+    --kv-cache-dtype "$KV_DTYPE" \
+    --max-model-len 32768 \
+    --compilation-config '{"cudagraph_mode":"none"}' \
+    --trust-remote-code
+
+echo "Container: $NAME"
+echo "Port: $PORT"
+echo "Logs: podman logs -f $NAME"

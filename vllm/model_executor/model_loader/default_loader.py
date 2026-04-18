@@ -243,12 +243,27 @@ class DefaultModelLoader(BaseModelLoader):
                         ),
                     )
                 else:
-                    weights_iterator = safetensors_weights_iterator(
-                        hf_weights_files,
-                        self.load_config.use_tqdm_on_load,
-                        self.load_config.safetensors_load_strategy,
-                        local_expert_ids=self.local_expert_ids,
-                    )
+                    # Streaming quant-on-load needs keys yielded per-layer
+                    # (safetensor shards interleave keys from many layers,
+                    # which defeats per-layer quant triggers).
+                    if getattr(self, "_streaming_quant_active", False):
+                        from vllm.model_executor.model_loader.weight_utils import (
+                            layer_grouped_safetensors_weights_iterator,
+                        )
+                        weights_iterator = \
+                            layer_grouped_safetensors_weights_iterator(
+                                hf_weights_files,
+                                self.load_config.use_tqdm_on_load,
+                                self.load_config.safetensors_load_strategy,
+                                local_expert_ids=self.local_expert_ids,
+                            )
+                    else:
+                        weights_iterator = safetensors_weights_iterator(
+                            hf_weights_files,
+                            self.load_config.use_tqdm_on_load,
+                            self.load_config.safetensors_load_strategy,
+                            local_expert_ids=self.local_expert_ids,
+                        )
         else:
             if extra_config.get("enable_multithread_load"):
                 weights_iterator = multi_thread_pt_weights_iterator(
