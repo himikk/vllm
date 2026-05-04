@@ -78,8 +78,8 @@ def get_flash_attn_version(
         if device_capability.major == 9 and is_fa_version_supported(3):
             # Hopper (SM90): prefer FA3
             fa_version = 3
-        elif device_capability.major == 10 and is_fa_version_supported(4):
-            # Blackwell (SM100+, restrict to SM100 for now): prefer FA4
+        elif device_capability.major >= 10 and is_fa_version_supported(4):
+            # Blackwell (SM100+) and later: prefer FA4
             fa_version = 4
         else:
             # Fallback to FA2
@@ -141,17 +141,19 @@ def get_flash_attn_version(
             )
             fa_version = 2
 
-        # FA4 on SM100 (Blackwell) has TMEM capacity limits that restrict
+        # FA4 on SM100/SM110 (Blackwell) has TMEM capacity limits that restrict
         # supported head dimensions.
         # See: https://github.com/Dao-AILab/flash-attention/issues/1959
-        # Exception: hdim 192 is supported for MLA's diff-headdim case
+        # Exceptions: hdim 192 is supported for MLA's diff-headdim case
         # (qk=192, v=128), added upstream in commits 1a15733e/1b36ab19.
+        # hdim 256 is supported on SM110+.
         if (
             fa_version == 4
             and device_capability.major >= 10
             and head_size is not None
             and head_size > 128
             and head_size != 192
+            and not (device_capability.minor >= 1 and head_size == 256)
         ):
             logger.warning_once(
                 "FA4 on Blackwell does not support head_size=%d due to TMEM "
