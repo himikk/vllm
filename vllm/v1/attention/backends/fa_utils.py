@@ -146,7 +146,7 @@ def get_flash_attn_version(
         # See: https://github.com/Dao-AILab/flash-attention/issues/1959
         # Exceptions: hdim 192 is supported for MLA's diff-headdim case
         # (qk=192, v=128), added upstream in commits 1a15733e/1b36ab19.
-        # hdim 256 is supported on SM110+.
+        # hdim 256 is supported on SM100.1+ and SM110+ (Jetson Thor).
         if (
             fa_version == 4
             and device_capability.major >= 10
@@ -154,6 +154,7 @@ def get_flash_attn_version(
             and head_size > 128
             and head_size != 192
             and not (device_capability.minor >= 1 and head_size == 256)
+            and not (device_capability.major == 11 and head_size == 256)
         ):
             logger.warning_once(
                 "FA4 on Blackwell does not support head_size=%d due to TMEM "
